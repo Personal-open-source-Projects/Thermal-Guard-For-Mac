@@ -1,0 +1,19 @@
+[package]
+name = "thermalguard"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "thermalguardd"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+strip = true
+# unwind (not abort): a panic inside one IPC handler must not take down the
+# thermal engine and drop the user back into an unprotected state.
+panic = "unwind"
+
+# Deliberately zero external dependencies: the thermal core links only against
+# the system IOKit/CoreFoundation frameworks so the build is reproducible offline.
+[dependencies]
