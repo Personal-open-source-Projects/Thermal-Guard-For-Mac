@@ -160,3 +160,4 @@ These keep Bitdefender and Wacom fully functional:
 - Intel build (`x86_64`) — correct for this machine; Apple Silicon needs a
   native rebuild with different sensors.
 # Thermal-Guard-For-Mac
+# Thermal-Guard-For-Mac
