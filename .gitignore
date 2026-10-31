@@ -1,3 +1,6 @@
 .DS_Store
 daemon/target/
 build/
+*.dmg
+MD5SUMS
+SHA256SUMS

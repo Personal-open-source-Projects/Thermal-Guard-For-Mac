@@ -26,6 +26,7 @@ regression test.
 | 6 | **Low** | Root daemon resolved child binaries via `PATH` (`ps`, `pmset`, `launchctl`, …) → PATH-hijack to attacker binary if the environment were ever altered. | Every child process is invoked by absolute path. | code review |
 | 7 | **Low** | Installer script copied `$1` to `/Library/PrivilegedHelperTools` with root rights and interpolated the path into a plist. | Input must be `*.app` with `Contents/`, no newline/quote/backslash; source must be a regular file (not a symlink) whose first 4 bytes are a Mach-O magic; copied as `root:wheel 0755`. | manual review + runtime guard |
 | 8 | **Low** | UI built the login-item plist and the admin shell command by string concatenation. | Plist is written with `PropertyListSerialization` (no XML injection) and shell arguments use POSIX single-quote escaping. | manual review |
+| 9 | **Low** | The `enable` flag was read with a substring match (`req.contains("\"enable\":true")`), so the text could be smuggled inside another field and flip a service toggle the user never asked for. | `json::get_bool()` accepts only a real `true`/`false` literal directly after `"enable":`. | `enable_is_only_read_from_a_real_boolean_field` |
 
 ## Verified properties
 

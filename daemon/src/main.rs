@@ -591,7 +591,7 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
         let mut note = String::new();
         if cmd == "apple_set" {
             let id = safe_label(&json::get_str(&req, "id").unwrap_or_default());
-            let enable = req.contains("\"enable\":true");
+            let enable = json::get_bool(&req, "enable").unwrap_or(false);
             match apple::set(&id, enable) {
                 Ok(msg) => {
                     log_line(&msg);
@@ -616,7 +616,7 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
         let mut note = String::new();
         if cmd == "agent" {
             let label = safe_label(&json::get_str(&req, "label").unwrap_or_default());
-            let enable = req.contains("\"enable\":true");
+            let enable = json::get_bool(&req, "enable").unwrap_or(false);
             // No path or scope from the caller: the daemon resolves them itself
             // by label, so it cannot be steered at an arbitrary plist.
             match agents::set_enabled(&label, enable) {

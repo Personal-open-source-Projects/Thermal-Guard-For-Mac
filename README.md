@@ -131,14 +131,95 @@ side-by-side: pinning the power cap dropped the die from 74.6 °C to 65.8 °C in
 20 s and the fan still read ~8000 RPM — so on this chassis the fan is driven by
 something other than CPU die temperature and cannot be slowed from userspace.
 
-## Build
+## Download
+
+Installers are published as **GitHub Releases** and are not committed to the
+repository:
+
+<https://github.com/procoder317/Thermal-Guard-For-Mac/releases/latest>
+
+Every release attaches `ThermalGuard-<version>.dmg` together with `SHA256SUMS`
+and `MD5SUMS`. Verify the download before opening it:
 
 ```bash
-bash scripts/build.sh      # -> build/ThermalGuard.app
-bash scripts/make_dmg.sh   # -> ThermalGuard-<version>.dmg (version read from Info.plist)
+cd ~/Downloads
+shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.2.0.dmg
+md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.2.0.dmg
 ```
 
-Requires `cargo` (rustup, `x86_64-apple-darwin`) and Command Line Tools.
+## Local setup
+
+Requirements: macOS 13+, Xcode Command Line Tools (`xcode-select --install`)
+and a Rust toolchain. The app is built for `x86_64-apple-darwin` (Intel).
+
+```bash
+git clone git@github.com:procoder317/Thermal-Guard-For-Mac.git
+cd Thermal-Guard-For-Mac
+
+# only if rustup is not installed yet
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup target add x86_64-apple-darwin
+
+bash scripts/build.sh     # -> build/ThermalGuard.app
+open build/ThermalGuard.app
+```
+
+`build/`, `*.dmg` and the checksum files are git-ignored: they are build
+outputs, not sources.
+
+## Build
+
+| Command | Output |
+|---|---|
+| `bash scripts/build.sh` | `build/ThermalGuard.app` — Rust daemon + SwiftUI UI, ad-hoc signed with hardened runtime |
+| `bash scripts/make_dmg.sh` | `ThermalGuard-<version>.dmg` — version read from `app/Info.plist`, so the file name cannot drift |
+| `bash scripts/checksums.sh` | `MD5SUMS` and `SHA256SUMS` covering every `.dmg` in the repo root |
+
+Typical release build, from a clean checkout:
+
+```bash
+bash scripts/build.sh && bash scripts/make_dmg.sh && bash scripts/checksums.sh
+```
+
+Then upload the three files to a new GitHub release tagged `v<version>`.
+
+## Tests
+
+```bash
+cd daemon
+cargo test              # unit + integration (IPC) suite
+cargo test --release    # same, optimised build
+```
+
+What the suite covers: policy hysteresis and mode switching, the
+never-demote/protected-process rules, the curated Apple-service allowlist,
+launchd path validation (no caller-supplied paths), socket permissions,
+oversized/truncated requests, handler-panic isolation, label sanitisation, and
+the full JSON contract the UI depends on.
+
+## Security testing
+
+`SECURITY.md` is the threat model: every finding, its fix and the test that
+locks the fix in. To re-check the guarantees locally:
+
+1. **Automated** — `cd daemon && cargo test --release`; the security-relevant
+   cases are `caller_supplied_path_cannot_bootstrap_an_arbitrary_plist`,
+   `arbitrary_apple_service_cannot_be_toggled`,
+   `labels_with_control_characters_are_neutralised`,
+   `oversized_request_is_truncated_and_daemon_survives`,
+   `handler_panics_do_not_take_the_engine_down` and
+   `socket_is_owner_only_not_world_writable`.
+2. **Socket exposure** — after installing the helper,
+   `ls -l /var/run/thermalguard.sock` shows a root-owned socket; connecting as
+   any uid other than root or the console user must return
+   `{"error":"unauthorised"}` and be logged.
+3. **Privilege boundary** — the UI never runs as root: only the daemon does,
+   and it accepts a service *label*, resolving and re-validating the plist path
+   itself (never a caller-supplied path).
+4. **No network** — `lsof -i -n -P | grep thermalguardd` prints nothing; the
+   daemon performs no network I/O and needs no entitlements to do so.
+5. **Static review** — `grep -rn 'sh -c\|Command::new("' daemon/src` must show
+   absolute-path argv arrays only, never a shell string.
 
 ## Install
 

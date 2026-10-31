@@ -67,6 +67,22 @@ pub fn get_str(src: &str, key: &str) -> Option<String> {
     }
 }
 
+/// Read a bare JSON boolean. Deliberately strict: only a `true`/`false` literal
+/// directly after `"key":` counts, so the text `"enable":true` smuggled inside
+/// another string field (a label, say) can never flip the decision.
+pub fn get_bool(src: &str, key: &str) -> Option<bool> {
+    let pat = format!("\"{}\"", key);
+    let start = src.find(&pat)? + pat.len();
+    let rest = src[start..].trim_start().strip_prefix(':')?.trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Only used by the test suite to assert on numbers we emit; kept test-only so
 /// the release build stays warning-free.
 #[cfg(test)]
@@ -88,6 +104,16 @@ mod tests {
     fn round_trips_strings_with_escapes() {
         let body = obj(&[s("cmd", "say \"hi\"\nnow")]);
         assert_eq!(get_str(&body, "cmd").unwrap(), "say \"hi\"\nnow");
+    }
+
+    #[test]
+    fn enable_is_only_read_from_a_real_boolean_field() {
+        assert_eq!(get_bool("{\"enable\":true}", "enable"), Some(true));
+        assert_eq!(get_bool("{\"enable\" : false }", "enable"), Some(false));
+        // A label that merely contains the text must not count as the flag.
+        let smuggled = "{\"label\":\"x\\\"enable\\\":true\",\"enable\":false}";
+        assert_eq!(get_bool(smuggled, "enable"), Some(false));
+        assert_eq!(get_bool("{\"cmd\":\"agents\"}", "enable"), None);
     }
 
     #[test]
