@@ -31,7 +31,7 @@ Verified on the target machine (`MacBookAir9,1`, macOS 15.7.5):
 | 1 | **Package power exceeds what the chassis dissipates.** 10 W‑class Ice Lake chip allowed to boost to 3.5 GHz (ratio 35) into a ~10–13 W chassis. | `machdep.xcpm.soft_plimit_max_100mhz_ratio: 35` vs `lpm_plimit_max: 24` | Power cap (`pmset lowpowermode`) → ceiling drops to 2.4 GHz |
 | 2 | **Fan is not thermally coupled to the heat pipe.** The SMC fan curve is acoustic‑first and has no user‑addressable target. So "fans at full blast" ≠ "cooler". | SMC `F0Ac` readable; `F0Tg` write is verified by read‑back and reported as unsupported when ignored | App detects this and says so instead of pretending |
 | 3 | **Constant background CPU bursts** keep the chip in boost so it never idles. | Live: load avg 5.00 / 8 threads, `XprotectService` 95 % CPU | Reversible QoS demotion (Darwin background class) |
-| 4 | **Security + vendor agents** (Bitdefender ES system extension, Wacom, Epson) are resident and always expensive. | `systemextensionsctl list` → `com.bitdefender.agentui.sp` active | **Explicitly protected — never throttled** |
+| 4 | **Security + vendor agents** (third-party system extensions and peripheral drivers) are resident and always expensive. | `systemextensionsctl list` → third-party `.sp` extensions active | **Explicitly protected — never throttled** |
 | 5 | **Charging while hot** stacks battery/VRM heat on SoC heat. | Battery temp reported separately | Shown in UI so you can act |
 
 Reinstalling macOS does not change #1 or #2 — they are design, not corruption.
@@ -45,9 +45,8 @@ Reinstalling macOS does not change #1 or #2 — they are design, not corruption.
 - Demotes only *unprotected* CPU hogs to background QoS. **Nothing is killed,
   suspended or signalled**, and a process gets its normal priority back as soon
   as it stops hogging.
-- **Never touches:** Bitdefender (`bitdefender`, `bdservicehost`,
-  `vshieldscanner`, `trufos`), Wacom (`wacom`), XProtect, `syspolicyd`,
-  `securityd`, MDM, and the window server / kernel.
+- **Never touches:** third-party security agents and peripheral drivers,
+  XProtect, `syspolicyd`, `securityd`, MDM, and the window server / kernel.
 - Reports honestly when a fan target is ignored (MacBookAir9,1).
 
 ### Modes
@@ -154,16 +153,11 @@ Uninstall: `sudo launchctl bootout system/com.thermalguard.daemon && sudo rm -f 
 
 ## Manual wins the app deliberately does not force
 
-These keep Bitdefender and Wacom fully functional:
+Small wins that are worth doing by hand:
 
-- Bitdefender → *Protection → Scan schedule*: one nightly scan, and add build /
-  node_modules / VM folders to exclusions. On‑access scanning of huge trees is
-  the biggest hidden CPU cost on this chip.
 - Spotlight → System Settings → Spotlight → *Search Privacy*: add the same
   build folders (`mdutil -a -i off` disables indexing globally — reversible, but
   too blunt to do automatically).
-- Wacom → keep the driver; it is protected here. If the tablet is unused for
-  weeks, quit **Wacom Center** (the driver keeps working without it).
 - Avoid the worst‑case combo: charging + external display + video call. The UI
   shows AC state and battery temperature so you can see it happening.
 - `pmset -g therm` → if `CPU_Speed_Limit` drops below 100, the OS is already

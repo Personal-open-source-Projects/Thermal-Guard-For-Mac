@@ -18,7 +18,7 @@ regression test.
 
 | # | Severity | Finding | Fix | Test |
 |---|----------|---------|-----|------|
-| 1 | **High** | Root daemon socket was mode `0666` and accepted commands from *any* local uid — e.g. `agent` could stop Bitdefender, or disable Spotlight. | Peer credential check with `getpeereid(2)`; only `uid 0` and the console user are served. Unauthorised peers get `{"error":"unauthorised"}` and the attempt is logged. | manual + code path guard |
+| 1 | **High** | Root daemon socket was mode `0666` and accepted commands from *any* local uid — e.g. `agent` could stop a critical third-party service, or disable Spotlight. | Peer credential check with `getpeereid(2)`; only `uid 0` and the console user are served. Unauthorised peers get `{"error":"unauthorised"}` and the attempt is logged. | manual + code path guard |
 | 2 | **High** | `agent` took `path` and `scope` from the JSON and passed them to `launchctl bootstrap` **as root** → arbitrary root code execution. | The caller supplies a *label* only; the daemon re-scans and resolves path/scope itself, then re-validates with `path_allowed()` (only `/Library/LaunchDaemons`, `/Library/LaunchAgents`, `/Users/*/Library/LaunchAgents`; no `..`, must be `.plist`). | `caller_supplied_path_cannot_bootstrap_an_arbitrary_plist`, `attacker_controlled_paths_are_rejected` |
 | 3 | **Medium** | `apple_set` accepted any `com.apple.*` label, so a caller could disable unrelated Apple services (WindowServer, securityd). | Toggle limited to a curated allowlist (`is_known`); unknown ids return `not a curated macOS service` before any process is spawned. | `arbitrary_apple_service_cannot_be_toggled`, `arbitrary_apple_labels_are_rejected` |
 | 4 | **Medium** | `short_name()` truncated at a *byte* index → a process named with multi-byte UTF-8 aborted the daemon (`panic = "abort"` + `KeepAlive` = crash loop → thermal protection silently lost). | Truncation is char-boundary safe and strips control characters. | `multibyte_names_never_panic_the_daemon`, `control_characters_are_stripped_from_names` |
@@ -31,8 +31,8 @@ regression test.
 
 - Apple services cannot be disabled by the daemon even if asked (two layers:
   exact allowlist in `apple.rs`, plus `com.apple.` refusal in `agents.rs`).
-- Bitdefender, Wacom, XProtect, `syspolicyd`, `securityd` are in the
-  never-demote allowlist and covered by tests.
+- Third-party security agents and peripheral drivers, XProtect, `syspolicyd`,
+  `securityd` are in the never-demote allowlist and covered by tests.
 - No `Command` in the daemon is built from a shell string: all invocations are
   argv arrays with absolute paths (no `sh -c`).
 - The daemon performs no network I/O of any kind.
