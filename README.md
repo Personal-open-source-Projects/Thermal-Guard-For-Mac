@@ -1,6 +1,6 @@
 # ThermalGuard
 
-Menu-bar app for **MacBook Air 9,1 (2020, Intel i5‑1030NG7, T2)** that stops the
+Menu-bar app for **MacBook Air 9,1 (2020, Intel i5, T2)** that stops the
 sustained overheating / fan-blast cycle at its source.
 
 Built as: **Rust** privileged thermal core (`thermalguardd`) + **SwiftUI**
