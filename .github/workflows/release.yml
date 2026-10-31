@@ -1,0 +1,52 @@
+name: Release
+
+# Installers are release assets, never commits: pushing a v* tag builds the app
+# from that exact commit and attaches the DMG plus its checksums.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: macos-13
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust (x86_64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Run the test suite
+        run: cargo test --release --manifest-path daemon/Cargo.toml
+
+      - name: Build the app bundle
+        run: bash scripts/build.sh
+
+      - name: Build the DMG
+        run: bash scripts/make_dmg.sh
+
+      - name: Generate checksums
+        run: bash scripts/checksums.sh
+
+      - name: Use the annotated tag message as release notes
+        run: git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > release-notes.md
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ThermalGuard ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            ThermalGuard-*.dmg
+            MD5SUMS
+            SHA256SUMS
+          fail_on_unmatched_files: true

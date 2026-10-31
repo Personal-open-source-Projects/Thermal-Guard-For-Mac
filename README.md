@@ -181,7 +181,16 @@ Typical release build, from a clean checkout:
 bash scripts/build.sh && bash scripts/make_dmg.sh && bash scripts/checksums.sh
 ```
 
-Then upload the three files to a new GitHub release tagged `v<version>`.
+Publishing is tag-driven (`.github/workflows/release.yml`). Bump
+`app/Info.plist`, then:
+
+```bash
+git tag -a v1.2.0 -m "ThermalGuard 1.2.0"   # the tag message becomes the release notes
+git push origin v1.2.0
+```
+
+CI runs the test suite, rebuilds from that commit, and attaches the DMG,
+`MD5SUMS` and `SHA256SUMS` to the release. Nothing binary is committed.
 
 ## Tests
 
