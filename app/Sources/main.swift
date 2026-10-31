@@ -590,7 +590,6 @@ struct RootView: View {
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 11) {
-                    header
                     hero
                     if !d.helperRunning { helperBanner }
                     modeCard
@@ -613,50 +612,6 @@ struct RootView: View {
     }
 
     // MARK: header
-
-    private var header: some View {
-        HStack(spacing: 11) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [d.accent, d.accent.opacity(0.62)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                Image(systemName: "fanblades.fill")
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(.white)
-            }
-            .frame(width: 38, height: 38)
-            .shadow(color: d.accent.opacity(0.35), radius: 7, y: 3)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text("ThermalGuard")
-                    .font(.system(size: 15, weight: .semibold))
-                Text(d.helperRunning ? d.headline : "Thermal helper not running")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-
-            Spacer(minLength: 8)
-
-            HStack(spacing: 5) {
-                Circle()
-                    .fill(d.helperRunning ? Color.green : Color.orange)
-                    .frame(width: 6, height: 6)
-                Text(d.helperRunning ? "Protecting" : "Offline")
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 4)
-            .background(Color.primary.opacity(0.05), in: Capsule())
-        }
-    }
 
     // MARK: hero
 
