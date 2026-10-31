@@ -41,30 +41,45 @@ Reinstalling macOS does not change #1 or #2 — they are design, not corruption.
 
 | Mode | Power cap | Demote threshold |
 |------|-----------|------------------|
-| **Auto** (default) | only above 78 °C (or when macOS starts throttling), released after 20 s below 70 °C | ≥ 80 % CPU |
+| **Auto** (default) | only above 78 °C (or when macOS starts throttling), released below 74 °C with 20 s of hysteresis | ≥ 80 % CPU |
 | Off | never | – |
 | Balanced | above 82 °C, release at 72 °C | ≥ 70 % CPU |
 | Cool & Quiet | always | ≥ 45 % CPU |
 | Max Cool | always | ≥ 30 % CPU |
 
-### Chrome guard
+### Hardware acceleration, in auto mode
 
-On this Intel Air, Chrome with **hardware acceleration off** decodes video in
-software, pegs both cores and hangs playback (M1 machines hide this because
-they have the headroom). Chrome keeps that flag in its own `Local State` file
-and an update can put it back to `false`, so ThermalGuard watches it on every
-refresh:
+On this Intel Air, a browser with **hardware acceleration off** decodes video in
+software, pegs both cores and hangs playback (an M1 hides this because it has
+the headroom). Chromium browsers keep that flag in their own `Local State`, and
+an update can put it back to `false`.
 
-- Chrome **closed** and the flag off → fixed silently, next launch is fast.
-- Chrome **running** and the flag off → a "Fix Chrome…" button appears; the app
-  quits Chrome, re-enables acceleration, clears the stale `GPUCache` and
-  relaunches it. It never quits your browser on its own.
+Watched automatically: Google Chrome, Microsoft Edge, Brave, Vivaldi, Chromium.
+
+When it acts — and only then:
+
+1. **Detection is real, not "the app is open".** A media session means a decode
+   pipeline is working (`VTDecoderXPCService`, `VideoToolbox`, `AVConference`),
+   or a camera is live anywhere in the system (`kCMIODeviceProperty-
+   DeviceIsRunningSomewhere`, read without any permission prompt), or an
+   unaccelerated browser is burning CPU — that last one *is* software decode.
+2. **Never mid-session.** If a video or camera call is live, the guard holds.
+   Restarting a decoder mid-call costs more than the heat it would save. It
+   surfaces a **Fix now…** button if you would rather take the interruption.
+3. **Repair once the session ends.** The app is marked as owed a fix the first
+   time it is caught decoding with acceleration off, and repaired on the next
+   quiet pass — restarted only if it is still running.
+
+If acceleration is already on and nothing is playing, it does nothing at all:
+no restarts, no config writes, no polls beyond the existing 2 s dashboard tick.
 
 Headless entry points, also used to test it:
 
 ```bash
-ThermalGuard --chrome-check   # {"installed":true,"enabled":true,...}, exit 3 if off
-ThermalGuard --chrome-fix     # applies the fix, exits 0 on success
+ThermalGuard --self-test      # 8 unit tests over the decision table
+ThermalGuard --media-pulse    # {"video":false,"camera":true}, exit 0 while a session is live
+ThermalGuard --accel-check    # every watch app + its usage, exit 3 if any is off
+ThermalGuard --accel-fix      # repairs what is owed, holding during a live session
 ```
 
 ### Calls and video are protected (automatic)
@@ -108,7 +123,7 @@ something other than CPU die temperature and cannot be slowed from userspace.
 
 ```bash
 bash scripts/build.sh      # -> build/ThermalGuard.app
-bash scripts/make_dmg.sh   # -> ThermalGuard-1.0.0.dmg
+bash scripts/make_dmg.sh   # -> ThermalGuard-1.1.0.dmg
 ```
 
 Requires `cargo` (rustup, `x86_64-apple-darwin`) and Command Line Tools.

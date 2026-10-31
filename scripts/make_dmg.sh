@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="$ROOT/build"
 APP="$BUILD/ThermalGuard.app"
 STAGE="$BUILD/dmg-stage"
-DMG="$ROOT/ThermalGuard-1.0.0.dmg"
+DMG="$ROOT/ThermalGuard-1.1.0.dmg"
 
 if [ ! -d "$APP" ]; then
   echo "app bundle missing; run scripts/build.sh first" >&2

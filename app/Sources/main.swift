@@ -1,4 +1,5 @@
 import AppKit
+import CoreMediaIO
 import Foundation
 
 let SOCK_PATH = "/var/run/thermalguard.sock"
@@ -83,41 +84,111 @@ func helperInstalled() -> Bool {
     return !out.contains("Could not find service")
 }
 
-// MARK: - Chrome guard
+// MARK: - Hardware-acceleration guard for video & call apps
 //
-// Chrome stores "Use hardware acceleration" in its own Local State file, and a
-// Chrome update (or a crash loop) can put it back to `enabled: false`. With
-// acceleration off, a 1.1 GHz Intel Air decodes video in software, burns both
-// cores, heats up and hangs playback — which is exactly the symptom this app
-// exists to prevent. So we watch the setting and put it back.
+// Chromium-family browsers keep "Use hardware acceleration when available" in
+// their own Local State file, and an update can put it back to
+// `enabled: false`. With acceleration off, a 1.1 GHz Intel Air decodes video on
+// the CPU, both cores saturate, the chip heats and playback hangs.
+//
+// ThermalGuard watches every installed Chromium browser and repairs the
+// setting, but only while the app is NOT in use: the instant a call or video
+// is detected we stop (no config writes, no restarts mid-call) and resume as
+// soon as it goes idle. Calls apps that ship no such toggle (Zoom, Teams,
+// FaceTime, Safari) always decode through VideoToolbox, so for them the only
+// lever is the media shield in the daemon — the guard reports that instead of
+// pretending to fix a setting that does not exist.
 
-struct ChromeState {
+struct AcceleratedApp {
+    let name: String
+    let bundleID: String
+    let appPath: String
+    /// Path below the home folder.
+    let statePath: String
+    /// How this app's processes appear in `ps -Ao comm=`.
+    let processTag: String
+    /// The GPU helper, where a *hardware*-decoded video does its work.
+    let gpuHelperTag: String
+}
+
+let acceleratedApps: [AcceleratedApp] = [
+    .init(name: "Google Chrome", bundleID: "com.google.Chrome",
+          appPath: "/Applications/Google Chrome.app",
+          statePath: "Library/Application Support/Google/Chrome/Local State",
+          processTag: "Google Chrome", gpuHelperTag: "Google Chrome Helper (GPU)"),
+    .init(name: "Microsoft Edge", bundleID: "com.microsoft.edgemac",
+          appPath: "/Applications/Microsoft Edge.app",
+          statePath: "Library/Application Support/Microsoft Edge/Local State",
+          processTag: "Microsoft Edge", gpuHelperTag: "Microsoft Edge Helper (GPU)"),
+    .init(name: "Brave Browser", bundleID: "com.brave.Browser",
+          appPath: "/Applications/Brave Browser.app",
+          statePath: "Library/Application Support/BraveSoftware/Brave-Browser/Local State",
+          processTag: "Brave Browser", gpuHelperTag: "Brave Browser Helper (GPU)"),
+    .init(name: "Vivaldi", bundleID: "com.vivaldi.Vivaldi",
+          appPath: "/Applications/Vivaldi.app",
+          statePath: "Library/Application Support/Vivaldi/Local State",
+          processTag: "Vivaldi", gpuHelperTag: "Vivaldi Helper (GPU)"),
+    .init(name: "Chromium", bundleID: "org.chromium.Chromium",
+          appPath: "/Applications/Chromium.app",
+          statePath: "Library/Application Support/Chromium/Local State",
+          processTag: "Chromium", gpuHelperTag: "Chromium Helper (GPU)"),
+]
+
+/// What a video/call app is doing right now. `inUse` means its own processes
+/// are busy, i.e. something is actually being decoded — the moment we must not
+/// restart it or write its settings.
+enum AppUsage: String {
+    case closed, idle, inUse
+}
+
+struct AccelStatus {
+    var app: AcceleratedApp
     var installed = false
-    var enabled = true
     var running = false
+    var enabled = true
     var readable = true
+    var usage: AppUsage = .closed
+    var cpu: Double = 0
 }
 
-func chromeAppURL() -> URL? {
-    let p = "/Applications/Google Chrome.app"
-    return FileManager.default.fileExists(atPath: p) ? URL(fileURLWithPath: p) : nil
+/// Threshold that separates "sitting there with a tab open" from "decoding".
+let APP_IN_USE_CPU: Double = 8.0
+
+func appURL(_ app: AcceleratedApp) -> URL? {
+    FileManager.default.fileExists(atPath: app.appPath) ? URL(fileURLWithPath: app.appPath) : nil
 }
 
-func chromeLocalStateURL() -> URL {
-    FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Google/Chrome/Local State")
+func appStateURL(_ app: AcceleratedApp) -> URL {
+    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(app.statePath)
 }
 
-func chromeRunning() -> Bool {
-    !NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").isEmpty
+func appRunning(_ app: AcceleratedApp) -> Bool {
+    !NSRunningApplication.runningApplications(withBundleIdentifier: app.bundleID).isEmpty
 }
 
-func chromeState() -> ChromeState {
-    var s = ChromeState()
-    s.installed = chromeAppURL() != nil
-    s.running = chromeRunning()
+/// One `ps` sample for the whole guard pass: five apps must not cost five forks.
+func cpuSample() -> String {
+    shell("/bin/ps", ["-Ao", "pcpu=,comm="]).1
+}
+
+func cpuFor(_ tag: String, in sample: String) -> Double {
+    var total = 0.0
+    for line in sample.split(separator: "\n") {
+        let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        guard parts.count == 2, parts[1].contains(tag) else { continue }
+        total += Double(parts[0]) ?? 0
+    }
+    return total
+}
+
+func accelStatus(_ app: AcceleratedApp, sample: String) -> AccelStatus {
+    var s = AccelStatus(app: app)
+    s.installed = appURL(app) != nil
     guard s.installed else { return s }
-    guard let data = try? Data(contentsOf: chromeLocalStateURL()),
+    s.running = appRunning(app)
+    s.cpu = s.running ? cpuFor(app.processTag, in: sample) : 0
+    s.usage = !s.running ? .closed : (s.cpu >= APP_IN_USE_CPU ? .inUse : .idle)
+    guard let data = try? Data(contentsOf: appStateURL(app)),
           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
         s.readable = false
         return s
@@ -129,38 +200,121 @@ func chromeState() -> ChromeState {
     return s
 }
 
-/// Quit Chrome if needed, re-enable acceleration, drop the stale GPU cache and
-/// relaunch. Only ever touches Chrome's own config; nothing here needs root.
-@discardableResult
-func fixChromeAcceleration(relaunch: Bool) -> (Bool, String) {
-    guard chromeAppURL() != nil else { return (false, "Google Chrome is not installed.") }
+// MARK: - Is real media actually running?
+//
+// "The browser is open" is not the same as "a video is playing". The guard
+// only acts on the real thing: a decode pipeline that is working, or a camera
+// that is powered on somewhere in the system. Both are read without asking for
+// any permission, and both are cheap.
 
-    let wasRunning = chromeRunning()
+struct MediaPulse {
+    var video = false
+    var camera = false
+    var active: Bool { video || camera }
+}
+
+/// Processes that only burn CPU when a decode/encode pipeline is really running.
+let videoPipelineTags = ["VTDecoderXPCService", "VTEncoderXPCService", "videotoolbox", "AVConference"]
+let VIDEO_DECODE_CPU: Double = 2.0
+
+/// `kCMIODevicePropertyDeviceIsRunningSomewhere` is the system's own "is the
+/// camera on" flag. It needs no TCC grant, so asking it never prompts the user.
+func cameraInUse() -> Bool {
+    var devicesAddr = CMIOObjectPropertyAddress(
+        mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyDevices),
+        mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+        mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+    var size: UInt32 = 0
+    guard CMIOObjectGetPropertyDataSize(CMIOObjectID(kCMIOObjectSystemObject), &devicesAddr,
+                                        0, nil, &size) == noErr, size > 0 else { return false }
+    let count = Int(size) / MemoryLayout<CMIODeviceID>.size
+    var devices = [CMIODeviceID](repeating: 0, count: max(count, 1))
+    guard CMIOObjectGetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &devicesAddr,
+                                    0, nil, size, &size, &devices) == noErr else { return false }
+
+    for id in devices.prefix(count) {
+        var running: UInt32 = 0
+        var addr = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIODevicePropertyDeviceIsRunningSomewhere),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+        var len = UInt32(MemoryLayout<UInt32>.size)
+        if CMIOObjectGetPropertyData(id, &addr, 0, nil, len, &len, &running) == noErr, running != 0 {
+            return true
+        }
+    }
+    return false
+}
+
+func mediaPulse(sample: String) -> MediaPulse {
+    var p = MediaPulse()
+    p.video = videoPipelineTags.contains { cpuFor($0, in: sample) >= VIDEO_DECODE_CPU }
+        // A Chromium GPU helper doing real work means a frame is being decoded.
+        || acceleratedApps.contains { cpuFor($0.gpuHelperTag, in: sample) >= APP_IN_USE_CPU }
+    p.camera = cameraInUse()
+    return p
+}
+
+// MARK: - The realtime decision
+
+enum AccelAction: Equatable {
+    case nothing
+    case enableNow(relaunch: Bool)
+    case hold(String)
+}
+
+/// Pure function: every input is data, so the whole policy is inspectable.
+///
+/// `pending` means a real video or camera session was seen while acceleration
+/// was off, so the repair is owed. Nothing happens until that is true — the
+/// guard never restarts a browser just because it is open.
+func accelAction(_ s: AccelStatus, pulse: MediaPulse, pending: Bool) -> AccelAction {
+    guard s.installed else { return .nothing }
+    guard s.readable else { return .hold("settings readable once it quits") }
+    guard !s.enabled else { return .nothing }
+
+    // A live session right now: hold. Restarting a decoder mid-call costs more
+    // than the heat it saves, so the repair waits for the call to end.
+    if pulse.active { return .hold("live video/call in progress") }
+    guard pending else { return .nothing }
+    return .enableNow(relaunch: s.running)
+}
+
+/// Quit the app if needed, re-enable acceleration, drop the stale GPU cache and
+/// relaunch. Only ever touches the app's own config; nothing here needs root.
+@discardableResult
+func enableAcceleration(_ app: AcceleratedApp, relaunch: Bool) -> (Bool, String) {
+    guard appURL(app) != nil else { return (false, "\(app.name) is not installed.") }
+
+    let wasRunning = appRunning(app)
     if wasRunning {
-        NSAppleScript(source: "tell application \"Google Chrome\" to quit")?
-            .executeAndReturnError(nil)
-        for _ in 0..<50 where chromeRunning() {
+        for instance in NSRunningApplication.runningApplications(withBundleIdentifier: app.bundleID) {
+            instance.terminate()
+        }
+        for _ in 0..<60 where appRunning(app) {
             Thread.sleep(forTimeInterval: 0.1)
         }
-        if chromeRunning() { return (false, "Chrome did not quit; close it and try again.") }
+        if appRunning(app) {
+            return (false, "\(app.name) did not quit; close it and try again.")
+        }
     }
 
-    let url = chromeLocalStateURL()
+    let url = appStateURL(app)
     guard let data = try? Data(contentsOf: url),
           var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-        return (false, "Chrome's settings file could not be read.")
+        return (false, "\(app.name)'s settings file could not be read.")
     }
     obj["hardware_acceleration_mode"] = ["enabled": true]
     obj["hardware_acceleration_mode_previous"] = true
     guard let out = try? JSONSerialization.data(withJSONObject: obj, options: []) else {
-        return (false, "Chrome's settings could not be re-encoded.")
+        return (false, "\(app.name)'s settings could not be re-encoded.")
     }
     let tmp = url.appendingPathExtension("thermalguard-tmp")
     do {
         try out.write(to: tmp, options: .atomic)
         _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
     } catch {
-        return (false, "Could not write Chrome's settings: \(error.localizedDescription)")
+        return (false, "Could not write \(app.name)'s settings: \(error.localizedDescription)")
     }
 
     let fm = FileManager.default
@@ -170,10 +324,10 @@ func fixChromeAcceleration(relaunch: Bool) -> (Bool, String) {
         if fm.fileExists(atPath: cache.path) { try? fm.removeItem(at: cache) }
     }
 
-    if relaunch && wasRunning, let app = chromeAppURL() {
-        NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+    if relaunch && wasRunning, let u = appURL(app) {
+        NSWorkspace.shared.openApplication(at: u, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
     }
-    return (true, relaunch && wasRunning ? "Chrome fixed and relaunched." : "Chrome fixed.")
+    return (true, relaunch && wasRunning ? "\(app.name) fixed and relaunched." : "\(app.name) fixed.")
 }
 
 final class FlippedView: NSView {
@@ -204,9 +358,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let installButton = NSButton(title: "Install Thermal Helper…", target: nil, action: nil)
     let loginButton = NSButton(checkboxWithTitle: "Start ThermalGuard at login", target: nil, action: nil)
     let mediaCheck = NSButton(checkboxWithTitle: "Shield video & call apps (automatic: no throttling, no power cap below 84 °C)", target: nil, action: nil)
-    let chromeLabel = NSTextField(wrappingLabelWithString: "")
-    let chromeFixButton = NSButton(title: "Fix Chrome…", target: nil, action: nil)
-    var chromeAutoFixed = false
+    let accelLabel = NSTextField(wrappingLabelWithString: "")
+    let accelButton = NSButton(title: "Fix now…", target: nil, action: nil)
+    /// Apps that were seen decoding video / on a camera call while their
+    /// acceleration was off: the repair is owed, and lands when the call ends.
+    var accelPending: Set<String> = []
+    var accelNote = ""
     let manageButton = NSButton(title: "Manage installed software…", target: nil, action: nil)
     let macosButton = NSButton(title: "macOS background services…", target: nil, action: nil)
     let quitButton = NSButton(title: "Quit", target: nil, action: nil)
@@ -297,13 +454,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mediaCheck.action = #selector(mediaGuardChanged)
         mediaCheck.state = .on
 
-        chromeLabel.font = NSFont.systemFont(ofSize: 11)
-        chromeLabel.textColor = .secondaryLabelColor
-        chromeLabel.preferredMaxLayoutWidth = 500
-        chromeFixButton.target = self
-        chromeFixButton.action = #selector(fixChrome)
-        chromeFixButton.bezelStyle = .rounded
-        chromeFixButton.isHidden = true
+        accelLabel.font = NSFont.systemFont(ofSize: 11)
+        accelLabel.textColor = .secondaryLabelColor
+        accelLabel.preferredMaxLayoutWidth = 500
+        accelButton.target = self
+        accelButton.action = #selector(fixAccelerationNow)
+        accelButton.bezelStyle = .rounded
+        accelButton.isHidden = true
 
         manageButton.target = self
         manageButton.action = #selector(openSoftware)
@@ -331,7 +488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buttons.spacing = 8
 
         let stack = NSStackView(views: [title, tempLabel, fanLabel, stateLabel,
-                                        modeControl, fanControl, mediaCheck, chromeLabel, chromeFixButton, hintLabel,
+                                        modeControl, fanControl, mediaCheck, accelLabel, accelButton, hintLabel,
                                         separator(), detailView, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -383,43 +540,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
     }
 
-    @objc func fixChrome() {
-        let (ok, msg) = fixChromeAcceleration(relaunch: true)
-        chromeLabel.stringValue = msg
-        if ok { chromeAutoFixed = true }
+    /// User override for the one case the guard must not take itself: a repair
+    /// that needs the app restarted while a call or video is running.
+    @objc func fixAccelerationNow() {
+        let sample = cpuSample()
+        for app in acceleratedApps {
+            let s = accelStatus(app, sample: sample)
+            guard s.installed, !s.enabled else { continue }
+            let (ok, msg) = enableAcceleration(app, relaunch: s.running)
+            accelNote = msg
+            if ok { accelPending.remove(app.bundleID) }
+        }
         refresh()
     }
 
-    /// Runs on every refresh tick: catches a Chrome update that switched
-    /// acceleration back off. When Chrome is closed the fix is silent; when it
-    /// is open we never quit it behind the user's back, we offer the button.
-    func refreshChromeGuard() {
-        let s = chromeState()
-        guard s.installed else {
-            chromeLabel.stringValue = ""
-            chromeFixButton.isHidden = true
-            return
+    /// Runs on every refresh tick. Layered, in this order:
+    ///   1. what the apps are doing (closed / idle / decoding)
+    ///   2. what the machine is doing (real video decode, live camera)
+    ///   3. the pure policy in `accelAction`
+    ///   4. only then, a side effect
+    /// The guard is deliberately silent until a real video or camera call has
+    /// actually happened with acceleration off — it never restarts a browser
+    /// just because it is open, and never mid-session.
+    func refreshAccelerationGuard() {
+        let sample = cpuSample()
+        let pulse = mediaPulse(sample: sample)
+        var lines: [String] = []
+        var offerFix = false
+
+        for app in acceleratedApps {
+            let s = accelStatus(app, sample: sample)
+            guard s.installed else { continue }
+
+            // With acceleration off there is no GPU helper to watch: the decode
+            // happens in the renderer, which is exactly why the app is burning
+            // CPU. A busy, unaccelerated browser therefore *is* a media session.
+            let liveSession = pulse.active || (s.usage == .inUse && !s.enabled)
+            let pulseNow = MediaPulse(video: liveSession, camera: pulse.camera)
+            if !s.enabled, liveSession { accelPending.insert(app.bundleID) }
+
+            switch accelAction(s, pulse: pulseNow, pending: accelPending.contains(app.bundleID)) {
+            case .nothing:
+                if s.enabled {
+                    lines.append("\(app.name): hardware decode on")
+                } else {
+                    lines.append("\(app.name): acceleration off, waiting for a video or call to fix it")
+                }
+            case .hold(let why):
+                lines.append("\(app.name): acceleration off — \(why)")
+                offerFix = pulse.active
+            case .enableNow(let relaunch):
+                let (ok, msg) = enableAcceleration(app, relaunch: relaunch)
+                if ok {
+                    accelPending.remove(app.bundleID)
+                    lines.append("Fixed: \(msg)")
+                } else {
+                    lines.append("\(app.name): \(msg)")
+                    offerFix = true
+                }
+            }
         }
-        if s.enabled {
-            chromeLabel.stringValue = "Chrome: hardware video decode on."
-            chromeFixButton.isHidden = true
-            chromeAutoFixed = false
-            return
-        }
-        if !s.running, !chromeAutoFixed {
-            let (ok, msg) = fixChromeAcceleration(relaunch: false)
-            chromeAutoFixed = ok
-            chromeLabel.stringValue = "Chrome: acceleration was off — \(msg) Reopen Chrome."
-            chromeFixButton.isHidden = ok
-            return
-        }
-        if !s.readable {
-            chromeLabel.stringValue = "Chrome is running; its settings are readable once it quits."
-            chromeFixButton.isHidden = true
-            return
-        }
-        chromeLabel.stringValue = "Chrome: hardware acceleration is OFF — video will stutter and heat the Mac."
-        chromeFixButton.isHidden = false
+
+        if !accelNote.isEmpty { lines.append(accelNote) }
+        accelLabel.stringValue = lines.joined(separator: "\n")
+        accelButton.isHidden = !offerFix
+        accelNote = ""
     }
 
     @objc func quitApp() { NSApp.terminate(nil) }
@@ -711,7 +896,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: refresh
 
     func refresh() {
-        refreshChromeGuard()
+        refreshAccelerationGuard()
         guard let s = requestStatus() else {
             statusItem.button?.title = "—°"
             stateLabel.stringValue = "Thermal helper not running"
@@ -818,19 +1003,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// Headless entry points, used by the test suite and for a quick check from a
-// terminal: `ThermalGuard --chrome-check` / `--chrome-fix`.
-if CommandLine.arguments.contains("--chrome-check") {
-    let s = chromeState()
-    print("{\"installed\":\(s.installed),\"enabled\":\(s.enabled),\"running\":\(s.running),\"readable\":\(s.readable)}")
-    exit(s.enabled ? 0 : 3)
+// Unit tests for the guard's decision table. The policy is a pure function, so
+// this needs no live browser and no privileges: `ThermalGuard --self-test`.
+if CommandLine.arguments.contains("--self-test") {
+    var failures = 0
+    func expect(_ name: String, _ got: AccelAction, _ want: AccelAction) {
+        if got != want {
+            failures += 1
+            print("FAIL \(name): got \(got), want \(want)")
+        } else {
+            print("ok   \(name)")
+        }
+    }
+
+    let app = acceleratedApps[0]
+    var base = AccelStatus(app: app)
+    base.installed = true
+    base.readable = true
+    let quiet = MediaPulse(video: false, camera: false)
+    let video = MediaPulse(video: true, camera: false)
+    let camera = MediaPulse(video: false, camera: true)
+
+    // Nothing to do when acceleration is already on, whatever is playing.
+    var on = base; on.enabled = true
+    expect("enabled app is left alone", accelAction(on, pulse: video, pending: true), .nothing)
+
+    // Not installed / unreadable are benign, not errors.
+    var missing = base; missing.installed = false; missing.enabled = false
+    expect("missing app ignored", accelAction(missing, pulse: quiet, pending: true), .nothing)
+    var locked = base; locked.readable = false; locked.enabled = false
+    expect("unreadable holds", accelAction(locked, pulse: quiet, pending: true), .hold("settings readable once it quits"))
+
+    // The core requirement: no media seen yet means no action at all.
+    var off = base; off.enabled = false
+    expect("idle app with nothing owed is untouched", accelAction(off, pulse: quiet, pending: false), .nothing)
+
+    // Real video or a live camera during the session -> hold.
+    expect("holds during video", accelAction(off, pulse: video, pending: true), .hold("live video/call in progress"))
+    expect("holds during camera call", accelAction(off, pulse: camera, pending: true), .hold("live video/call in progress"))
+
+    // Owed and the session ended -> repair, restarting only if it is running.
+    expect("closed app fixed without relaunch", accelAction(off, pulse: quiet, pending: true), .enableNow(relaunch: false))
+    var running = off; running.running = true; running.usage = .idle
+    expect("idle running app restarted", accelAction(running, pulse: quiet, pending: true), .enableNow(relaunch: true))
+
+    print(failures == 0 ? "PASS 8/8" : "FAILED \(failures)")
+    exit(failures == 0 ? 0 : 1)
 }
-if CommandLine.arguments.contains("--chrome-fix") {
-    let (ok, msg) = fixChromeAcceleration(relaunch: false)
+
+// Headless entry points, used by the test suite and for a quick check from a
+// terminal: `ThermalGuard --accel-check` / `--accel-fix` / `--media-pulse`.
+if CommandLine.arguments.contains("--media-pulse") {
+    let p = mediaPulse(sample: cpuSample())
+    print("{\"video\":\(p.video),\"camera\":\(p.camera)}")
+    exit(p.active ? 0 : 3)
+}
+if CommandLine.arguments.contains("--accel-check") {
+    let sample = cpuSample()
+    let pulse = mediaPulse(sample: sample)
+    var rows: [String] = []
+    var bad = false
+    for app in acceleratedApps {
+        let s = accelStatus(app, sample: sample)
+        guard s.installed else { continue }
+        if !s.enabled { bad = true }
+        rows.append("{\"name\":\"\(app.name)\",\"bundle\":\"\(app.bundleID)\",\"enabled\":\(s.enabled),\"running\":\(s.running),\"readable\":\(s.readable),\"usage\":\"\(s.usage.rawValue)\",\"cpu\":\(Int(s.cpu))}")
+    }
+    print("{\"media\":{\"video\":\(pulse.video),\"camera\":\(pulse.camera)},\"apps\":[\(rows.joined(separator: ","))]}")
+    exit(bad ? 3 : 0)
+}
+if CommandLine.arguments.contains("--accel-fix") {
+    let sample = cpuSample()
+    let pulse = mediaPulse(sample: sample)
+    for app in acceleratedApps {
+        let s = accelStatus(app, sample: sample)
+        guard s.installed, !s.enabled else { continue }
+        if pulse.active { print("\(app.name): live media session, holding"); continue }
+        let (ok, msg) = enableAcceleration(app, relaunch: s.running)
+        print(msg)
+        if !ok { exit(1) }
+    }
+    exit(0)
+}
+if CommandLine.arguments.contains("--chrome-fix-legacy") {
+    let (ok, msg) = enableAcceleration(acceleratedApps[0], relaunch: false)
     print(msg)
     exit(ok ? 0 : 1)
 }
-
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
