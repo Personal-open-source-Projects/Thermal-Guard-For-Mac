@@ -711,6 +711,10 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
         }
         if let Some(f) = apply_fan {
             sh.fan_intent = f;
+            // A fresh choice gets a fresh attempt: an earlier refused write
+            // must not delay the SMC being asked again (or the fan being
+            // handed back when the user returns to the SMC curve).
+            sh.fan_failed = None;
             match f {
                 FanIntent::Max => {
                     // Never ask for a value outside the SMC's own reported range.
@@ -730,8 +734,6 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                 }
                 FanIntent::Quiet => {
                     sh.fan_quiet_allowed = true;
-                    // New request: allow one fresh attempt at the SMC.
-                    sh.fan_failed = None;
                     sh.fan_note = "Silent requested: quieter fan if the SMC allows it, earlier power cap either way.".into();
                 }
                 FanIntent::Auto => {

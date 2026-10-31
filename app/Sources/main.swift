@@ -601,11 +601,12 @@ struct RootView: View {
                     footer
                 }
                 .padding(.horizontal, 18)
-                .padding(.top, 34)
+                .padding(.top, 16)
                 .padding(.bottom, 18)
             }
         }
-        .frame(width: 560, height: 780)
+        .frame(width: 560)
+        .frame(maxHeight: .infinity, alignment: .top)
         .background(Color.clear)
         .sheet(isPresented: $showSoftware) { SoftwareSheet(d: d) }
         .sheet(isPresented: $showMacOS) { MacOSSheet(d: d) }
@@ -758,7 +759,10 @@ struct RootView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .disabled(!d.fanSupported)
+            // Never locked: the preference is always the user's to change. On
+            // models whose firmware ignores fan targets the daemon simply says
+            // so in fanNote, and picking "SMC curve" still hands the fan back.
+            .help(d.fanSupported ? "Fan preference" : "This model's firmware ignores fan targets; the power cap does the cooling.")
 
             if !d.fanNote.isEmpty {
                 Text(d.fanNote)
@@ -1054,10 +1058,23 @@ struct MacOSSheet: View {
 
 // MARK: - App
 
+/// A borderless status-bar panel: it behaves like a popover hanging off the menu
+/// bar item, not like a regular app window. It can still take key focus so the
+/// pickers and buttons inside it work.
+final class PopupPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
+    static let preferredWidth: CGFloat = 560
+    static let preferredHeight: CGFloat = 720
+    static let minimumHeight: CGFloat = 380
+
     var statusItem: NSStatusItem!
     var window: NSWindow?
     var timer: Timer?
+    private var outsideClick: Any?
 
     // Live machine state, published straight into SwiftUI.
     @Published var helperRunning = false
@@ -1132,12 +1149,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         buildStatusItem()
         buildWindow()
         refresh()
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        showPanel()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         RunLoop.main.add(timer!, forMode: .common)
+    }
+
+    /// Clicking anywhere outside the app closes the popup, like a menu.
+    func applicationDidResignActive(_ notification: Notification) {
+        hidePanel()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -1155,33 +1176,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @objc func toggleWindow() {
         guard let w = window else { return }
         if w.isVisible {
-            w.orderOut(nil)
+            hidePanel()
         } else {
-            refresh()
-            w.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            showPanel()
+        }
+    }
+
+    func showPanel() {
+        guard let w = window else { return }
+        refresh()
+        positionPanel()
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        if outsideClick == nil {
+            outsideClick = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+                self?.hidePanel()
+            }
+        }
+    }
+
+    func hidePanel() {
+        window?.orderOut(nil)
+        if let m = outsideClick {
+            NSEvent.removeMonitor(m)
+            outsideClick = nil
         }
     }
 
     // MARK: window
 
     func buildWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 780),
-                         styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
-                         backing: .buffered, defer: false)
-        w.title = "ThermalGuard"
-        w.titleVisibility = .hidden
-        w.titlebarAppearsTransparent = true
-        w.isMovableByWindowBackground = true
+        let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        // Never taller than the space the screen actually offers, so the bottom
+        // of the panel can never end up off-screen. The content scrolls.
+        let height = min(Self.preferredHeight, max(Self.minimumHeight, visible.height - 24))
+
+        let w = PopupPanel(contentRect: NSRect(x: 0, y: 0, width: Self.preferredWidth, height: height),
+                           styleMask: [.borderless, .nonactivatingPanel],
+                           backing: .buffered, defer: false)
+        w.level = .statusBar
+        w.isFloatingPanel = true
+        w.hidesOnDeactivate = true
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         w.backgroundColor = .clear
         w.isOpaque = false
-        w.center()
+        w.hasShadow = true
+        w.isMovable = false
         w.isReleasedWhenClosed = false
-        w.contentMinSize = NSSize(width: 560, height: 560)
+        w.animationBehavior = .utilityWindow
 
-        // Real window translucency: SwiftUI materials sit on top of this.
-        let fx = NSVisualEffectView()
-        fx.material = .underWindowBackground
+        // Rounded, clipped shell so the panel reads as a popover even though it
+        // is a borderless window.
+        let shell = NSView()
+        shell.wantsLayer = true
+        shell.layer?.cornerRadius = 14
+        shell.layer?.masksToBounds = true
+        shell.layer?.borderWidth = 1
+        shell.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
+
+        let fx = NSVisualEffectView(frame: shell.bounds)
+        fx.material = .popover
         fx.blendingMode = .behindWindow
         fx.state = .active
         fx.autoresizingMask = [.width, .height]
@@ -1191,8 +1245,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         host.autoresizingMask = [.width, .height]
         fx.addSubview(host)
 
-        w.contentView = fx
+        shell.addSubview(fx)
+        w.contentView = shell
         window = w
+    }
+
+    /// Hang the panel under the status item, clamped to that screen.
+    private func positionPanel() {
+        guard let w = window,
+              let button = statusItem.button,
+              let bar = button.window else { return }
+        let anchor = bar.convertToScreen(button.convert(button.bounds, to: nil))
+        let screen = bar.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
+
+        let width = Self.preferredWidth
+        let top = anchor.minY - 6
+        let height = min(Self.preferredHeight, max(Self.minimumHeight, top - screen.minY - 8))
+        var x = anchor.midX - width / 2
+        x = min(max(x, screen.minX + 8), screen.maxX - width - 8)
+
+        w.setFrame(NSRect(x: x, y: top - height, width: width, height: height), display: false)
     }
 
     // MARK: actions from the UI

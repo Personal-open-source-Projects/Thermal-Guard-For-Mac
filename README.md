@@ -7,9 +7,12 @@ Built as: **Rust** privileged thermal core (`thermalguardd`) + **SwiftUI**
 menu-bar UI + `.dmg` installer. No third‑party crates, no kexts, **no SIP
 changes**.
 
-## The window
+## The popup
 
-A frosted, hidden-titlebar window in the current macOS idiom: a thermal ring
+A frosted panel that hangs off the menu-bar item, sized to the screen it opens
+on and dismissed by clicking anywhere outside it — no separate title-bar
+window, and the bottom of the content can never fall off-screen. Inside: a
+thermal ring
 that fills with the die temperature, live fan / clock / battery / SMC readings,
 a status strip of chips (mode, cap, OS throttling, call shield), then mode and
 fan pickers, the video & call guard, a live per-process CPU card, and recent
