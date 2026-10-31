@@ -21,8 +21,14 @@ case "$APP_PATH" in
   *) echo "refusing: not an app bundle: $APP_PATH" >&2; exit 64 ;;
 esac
 case "$APP_PATH" in
-  *"\n"*|*'"'*|*\\*) echo "refusing: unsafe characters in path" >&2; exit 64 ;;
+  *'"'*|*\\*) echo "refusing: unsafe characters in path" >&2; exit 64 ;;
 esac
+# A newline cannot be matched portably inside a case pattern, so test for it
+# directly: it would break the plist generated further down.
+if [ "$(printf '%s' "$APP_PATH" | tr -d '\n')" != "$APP_PATH" ]; then
+  echo "refusing: unsafe characters in path" >&2
+  exit 64
+fi
 if [ ! -d "$APP_PATH/Contents" ]; then
   echo "refusing: missing Contents directory" >&2
   exit 66

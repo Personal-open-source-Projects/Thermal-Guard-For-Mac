@@ -267,6 +267,35 @@ Small wins that are worth doing by hand:
   `pmset -g custom`, demotion by return value. Failures are logged, not hidden.
 - Log: `/var/log/thermalguard.log`; state: `/var/run/thermalguard/state.json`.
 
+### Decision layer
+
+`policy.rs` is deliberately a deterministic state machine — no model, no
+network call, no randomness — so the same sensors always produce the same
+action and every rule can be tested without hardware.
+
+| Input | Auto | Balanced | Cool & Quiet / Max Cool |
+|---|---|---|---|
+| temperature ≥ engage (°C) | cap | cap | cap |
+| warm **and** `CPU_Speed_Limit < 95` | cap | — | cap |
+| temperature ≤ release (°C) **and** dwell elapsed | release | release | — |
+| temperature unreadable / non‑finite | hold current state | hold current state | cap |
+| OS throttling alone, chip cool | no cap | no cap | cap |
+
+Invariants the code and tests enforce:
+
+- **Releasing protection needs positive evidence.** A missing, `NaN` or infinite
+  reading is never treated as "cool"; the cap is held.
+- **Throttling is an engage signal only.** It is never required to release, so
+  a machine whose `CPU_Speed_Limit` stays below 100 cannot deadlock capped.
+- **Every transition has a dwell time** (20 s Auto, 10 s Balanced) measured
+  from when the cap engaged, so a stray sample cannot flap turbo on and off.
+- **Silent fan shifts the thresholds earlier** (−6 °C, −10 % demote bar) rather
+  than overriding safety, and is handed back to the SMC above 88 °C.
+- **Media guard relaxes only the extra clamping** — never the safety limit —
+  and only on a known temperature below 84 °C.
+- Demotion only ever touches *unprotected* processes and is reversible; nothing
+  is killed or suspended.
+
 ## Known limits
 
 - No fan RPM *control* on MacBookAir9,1 — hardware, not software. The app tells

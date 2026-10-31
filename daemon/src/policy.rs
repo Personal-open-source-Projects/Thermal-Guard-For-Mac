@@ -76,6 +76,11 @@ const FAN_SAFETY_RESUME_C: f64 = 80.0;
 /// trusted, and we must not write to it.
 const MAX_PLAUSIBLE_FAN_RPM: f64 = 20000.0;
 
+/// `Balanced` keeps the cap engaged for at least this long before it may be
+/// released. Without it a single cool sample handed turbo straight back in the
+/// middle of a warm session, and the cap flapped on and off every tick.
+const BALANCED_DWELL_S: u64 = 10;
+
 /// The quiet fan target, derived only from the SMC's own reported range.
 ///
 /// Nothing from the wire reaches this function: the caller cannot ask for an
@@ -275,15 +280,20 @@ pub fn evaluate(
     let cap_power = match mode {
         Mode::Off => false,
         Mode::Auto => auto_should_cap_with(t, temp_c, speed_limit, cap_active, capped_for_s),
+        // Balanced follows the same safety asymmetry as Auto: an unreadable
+        // temperature is not evidence of cooling, so an engaged cap is held
+        // rather than dropped. Releasing protection is only ever justified by a
+        // known, cool reading that has also satisfied the dwell time.
         Mode::Balanced => match temp_c {
-            Some(v) => {
+            Some(v) if v.is_finite() => {
                 if cap_active {
-                    v > t.release_c
+                    v > t.release_c || capped_for_s < BALANCED_DWELL_S
                 } else {
                     v >= t.engage_c
                 }
             }
-            None => false,
+            // Unreadable or non-finite: hold whatever we are already doing.
+            _ => cap_active,
         },
         Mode::CoolQuiet | Mode::MaxCool => true,
     };
@@ -384,8 +394,28 @@ mod tests {
 
     #[test]
     fn balanced_has_hysteresis_between_release_and_engage() {
-        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(75.0), None, true, 0, &[]).cap_power);
-        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(71.9), None, true, 0, &[]).cap_power);
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(75.0), None, true, 60, &[]).cap_power);
+        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(71.9), None, true, 60, &[]).cap_power);
+    }
+
+    #[test]
+    fn balanced_waits_for_the_dwell_before_releasing() {
+        // Cool reading, but the cap has only just engaged: hold it.
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(60.0), None, true, 2, &[]).cap_power);
+        // Dwell satisfied: hand performance back.
+        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(60.0), None, true, BALANCED_DWELL_S, &[]).cap_power);
+        // A genuinely hot reading keeps it engaged however long it has been up.
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(90.0), None, true, 600, &[]).cap_power);
+    }
+
+    #[test]
+    fn balanced_holds_the_cap_when_the_temperature_is_unreadable() {
+        // Unreadable is never permission to relax protection.
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, None, None, true, 600, &[]).cap_power);
+        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, None, None, false, 0, &[]).cap_power);
+        // Non-finite readings behave like unreadable ones.
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(f64::NAN), None, true, 600, &[]).cap_power);
+        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(f64::NAN), None, false, 0, &[]).cap_power);
     }
 
     #[test]

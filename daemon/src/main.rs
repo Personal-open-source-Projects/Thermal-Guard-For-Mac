@@ -969,9 +969,14 @@ fn main() {
         }
 
         // 2) Background load demotion.
+        //
+        // The pids came from a `ps` snapshot taken earlier in this tick, so a
+        // process may have exited and its pid been reused in the meantime.
+        // Confirm identity immediately before touching it, so background QoS
+        // is never applied to an unrelated process.
         let mut newly = Vec::new();
         for (pid, name) in &decision.demote {
-            if procs::demote(*pid) {
+            if procs::same_process(*pid, name) && procs::demote(*pid) {
                 newly.push((*pid, name.clone()));
             }
         }
