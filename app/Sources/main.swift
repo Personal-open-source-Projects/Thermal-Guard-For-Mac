@@ -1064,6 +1064,13 @@ struct MacOSSheet: View {
 final class PopupPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    /// Escape closes the popup, the way a tooltip or menu behaves.
+    var onCancel: (() -> Void)?
+
+    override func cancelOperation(_ sender: Any?) {
+        onCancel?()
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
@@ -1186,6 +1193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         guard let w = window else { return }
         refresh()
         positionPanel()
+        statusItem.button?.highlight(true)
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         if outsideClick == nil {
@@ -1197,6 +1205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     func hidePanel() {
         window?.orderOut(nil)
+        statusItem.button?.highlight(false)
         if let m = outsideClick {
             NSEvent.removeMonitor(m)
             outsideClick = nil
@@ -1224,6 +1233,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         w.isMovable = false
         w.isReleasedWhenClosed = false
         w.animationBehavior = .utilityWindow
+        // No window chrome of any kind: borderless already means no close,
+        // minimise, zoom or resize controls, and it must not be resizable.
+        w.styleMask = [.borderless, .nonactivatingPanel]
+        w.isMovableByWindowBackground = false
 
         // Rounded, clipped shell so the panel reads as a popover even though it
         // is a borderless window.
@@ -1247,6 +1260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
         shell.addSubview(fx)
         w.contentView = shell
+        w.onCancel = { [weak self] in self?.hidePanel() }
         window = w
     }
 
@@ -1259,7 +1273,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         let screen = bar.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
 
         let width = Self.preferredWidth
-        let top = anchor.minY - 6
+        // Flush against the menu bar so the panel reads as attached to the
+        // status item rather than as a floating window.
+        let top = anchor.minY
         let height = min(Self.preferredHeight, max(Self.minimumHeight, top - screen.minY - 8))
         var x = anchor.midX - width / 2
         x = min(max(x, screen.minX + 8), screen.maxX - width - 8)
