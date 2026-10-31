@@ -6,7 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="$ROOT/build"
 APP="$BUILD/ThermalGuard.app"
 STAGE="$BUILD/dmg-stage"
-DMG="$ROOT/ThermalGuard-1.1.0.dmg"
+# Version comes from the bundle, so the DMG name can never drift from what ships.
+VER="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$ROOT/app/Info.plist")"
+DMG="$ROOT/ThermalGuard-$VER.dmg"
 
 if [ ! -d "$APP" ]; then
   echo "app bundle missing; run scripts/build.sh first" >&2

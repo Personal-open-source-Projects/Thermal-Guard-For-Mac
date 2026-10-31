@@ -18,7 +18,7 @@ echo "==> 3/6 Swift UI"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 xcrun -sdk macosx swiftc -O \
   -target x86_64-apple-macosx13.0 \
-  -framework AppKit -framework Foundation -framework CoreMediaIO \
+  -framework AppKit -framework Foundation -framework CoreMediaIO -framework SwiftUI \
   -o "$APP/Contents/MacOS/ThermalGuard" \
   "$ROOT/app/Sources/main.swift"
 

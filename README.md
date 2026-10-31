@@ -3,9 +3,22 @@
 Menu-bar app for **MacBook Air 9,1 (2020, Intel i5‑1030NG7, T2)** that stops the
 sustained overheating / fan-blast cycle at its source.
 
-Built as: **Rust** privileged thermal core (`thermalguardd`) + **Swift/AppKit**
+Built as: **Rust** privileged thermal core (`thermalguardd`) + **SwiftUI**
 menu-bar UI + `.dmg` installer. No third‑party crates, no kexts, **no SIP
 changes**.
+
+## The window
+
+A frosted, hidden-titlebar window in the current macOS idiom: a thermal ring
+that fills with the die temperature, live fan / clock / battery / SMC readings,
+a status strip of chips (mode, cap, OS throttling, call shield), then mode and
+fan pickers, the video & call guard, a live per-process CPU card, and recent
+events. One accent colour runs through the whole window and follows the
+machine: teal → green → orange → red. Software and macOS-service management
+open as sheets, with a confirmation before anything is disabled.
+
+The data layer is unchanged: the window is a pure view over the same daemon
+tick, so every safety rule above still holds no matter what the UI shows.
 
 ---
 
@@ -123,7 +136,7 @@ something other than CPU die temperature and cannot be slowed from userspace.
 
 ```bash
 bash scripts/build.sh      # -> build/ThermalGuard.app
-bash scripts/make_dmg.sh   # -> ThermalGuard-1.1.0.dmg
+bash scripts/make_dmg.sh   # -> ThermalGuard-<version>.dmg (version read from Info.plist)
 ```
 
 Requires `cargo` (rustup, `x86_64-apple-darwin`) and Command Line Tools.

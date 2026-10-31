@@ -1,6 +1,8 @@
 import AppKit
+import Combine
 import CoreMediaIO
 import Foundation
+import SwiftUI
 
 let SOCK_PATH = "/var/run/thermalguard.sock"
 let HELPER_LABEL = "com.thermalguard.daemon"
@@ -330,57 +332,808 @@ func enableAcceleration(_ app: AcceleratedApp, relaunch: Bool) -> (Bool, String)
     return (true, relaunch && wasRunning ? "\(app.name) fixed and relaunched." : "\(app.name) fixed.")
 }
 
-final class FlippedView: NSView {
-    override var isFlipped: Bool { true }
+// MARK: - Design system
+//
+// Everything visual lives here. The engineering is unchanged: the same IPC,
+// the same acceleration guard, the same reversible software toggles. The look
+// follows current macOS: system materials, SF symbols, rounded cards, one
+// accent colour that follows the machine's actual thermal state.
+
+private let cardRadius: CGFloat = 14
+
+private extension View {
+    /// A frosted card: the material lets the desktop show through the window,
+    /// the hairline keeps it legible on a bright wallpaper.
+    func cardSurface() -> some View {
+        self
+            .padding(14)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: cardRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+            )
+    }
+}
+
+private struct CardTitle: View {
+    let icon: String
+    let text: String
+    var trailing: String? = nil
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text(text.uppercased())
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(0.7)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            if let t = trailing, !t.isEmpty {
+                Text(t)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.secondary.opacity(0.85))
+                    .lineLimit(1)
+            }
+        }
+    }
+}
+
+private struct Chip: View {
+    let text: String
+    var tint: Color = .secondary
+    var active = false
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10.5, weight: .medium))
+            .lineLimit(1)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3.5)
+            .background(
+                Capsule().fill(active ? tint.opacity(0.16) : Color.primary.opacity(0.05))
+            )
+            .overlay(
+                Capsule().strokeBorder(active ? tint.opacity(0.35) : Color.clear, lineWidth: 1)
+            )
+            .foregroundStyle(active ? tint : Color.secondary)
+    }
+}
+
+private struct MetricRow: View {
+    let icon: String
+    let label: String
+    let value: String
+    var tint: Color = .primary
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(width: 15, alignment: .center)
+            Text(label)
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 6)
+            Text(value)
+                .font(.system(size: 11.5, weight: .medium))
+                .monospacedDigit()
+                .foregroundStyle(tint)
+                .lineLimit(1)
+        }
+    }
+}
+
+/// Half-open ring that fills as the die heats up. 45-100 °C is the useful
+/// span on this hardware: below 45 is idle-cold, above 100 is an emergency.
+private struct TempRing: View {
+    let temp: Double?
+    let tint: Color
+
+    private var fraction: Double {
+        guard let t = temp else { return 0 }
+        return min(max((t - 45) / 55, 0.02), 1)
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.primary.opacity(0.07), lineWidth: 9)
+            Circle()
+                .trim(from: 0, to: fraction)
+                .stroke(
+                    AngularGradient(
+                        gradient: Gradient(colors: [tint.opacity(0.45), tint]),
+                        center: .center,
+                        startAngle: .degrees(-90),
+                        endAngle: .degrees(270)
+                    ),
+                    style: StrokeStyle(lineWidth: 9, lineCap: .round)
+                )
+                .rotationEffect(.degrees(-90))
+                .animation(.easeInOut(duration: 0.35), value: fraction)
+            VStack(spacing: -2) {
+                Text(temp.map { "\(Int($0.rounded()))" } ?? "–")
+                    .font(.system(size: 38, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(temp == nil ? Color.secondary : Color.primary)
+                Text("°C")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 108, height: 108)
+    }
+}
+
+private struct ToggleRow: View {
+    let title: String
+    let subtitle: String
+    let isOn: Bool
+    let onChange: (Bool) -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+            }
+            Spacer(minLength: 12)
+            Toggle("", isOn: Binding(get: { isOn }, set: onChange))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+        }
+        .padding(.vertical, 7)
+        .padding(.horizontal, 10)
+        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+}
+
+private struct ConfirmAction: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+    let confirmLabel: String
+    let run: () -> Void
+}
+
+private struct SheetHeader: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        HStack(spacing: 11) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.15))
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+            }
+            .frame(width: 30, height: 30)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(subtitle)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
+    }
+}
+
+// MARK: - Main window
+
+private let modeValues = ["auto", "off", "balanced", "coolquiet", "maxcool"]
+private let fanValues = ["auto", "quiet", "max"]
+
+private func modeTitle(_ v: String) -> String {
+    switch v {
+    case "off": return "Off"
+    case "balanced": return "Balanced"
+    case "coolquiet": return "Cool"
+    case "maxcool": return "Max"
+    default: return "Auto"
+    }
+}
+
+private func modeBlurb(_ v: String) -> String {
+    switch v {
+    case "off": return "ThermalGuard steps aside. macOS alone manages clock and fan."
+    case "balanced": return "Keeps clocks up and only caps near the top of the safe range."
+    case "coolquiet": return "Caps earlier and asks the fan for a gentle curve."
+    case "maxcool": return "Prioritises the lowest possible temperature over silence."
+    default: return "Reads the die every two seconds and caps only when it actually gets hot."
+    }
+}
+
+private func fanTitle(_ v: String) -> String {
+    switch v {
+    case "quiet": return "Silent"
+    case "max": return "Max"
+    default: return "SMC curve"
+    }
+}
+
+struct RootView: View {
+    @ObservedObject var d: AppDelegate
+    @State private var showSoftware = false
+    @State private var showMacOS = false
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            LinearGradient(
+                colors: [d.accent.opacity(0.22), d.accent.opacity(0.04), .clear],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 260)
+            .allowsHitTesting(false)
+
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 11) {
+                    header
+                    hero
+                    if !d.helperRunning { helperBanner }
+                    modeCard
+                    fanCard
+                    guardCard
+                    cpuCard
+                    if !d.events.isEmpty { eventsCard }
+                    footer
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 34)
+                .padding(.bottom, 18)
+            }
+        }
+        .frame(width: 560, height: 780)
+        .background(Color.clear)
+        .sheet(isPresented: $showSoftware) { SoftwareSheet(d: d) }
+        .sheet(isPresented: $showMacOS) { MacOSSheet(d: d) }
+    }
+
+    // MARK: header
+
+    private var header: some View {
+        HStack(spacing: 11) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [d.accent, d.accent.opacity(0.62)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                Image(systemName: "fanblades.fill")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+            .frame(width: 38, height: 38)
+            .shadow(color: d.accent.opacity(0.35), radius: 7, y: 3)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("ThermalGuard")
+                    .font(.system(size: 15, weight: .semibold))
+                Text(d.helperRunning ? d.headline : "Thermal helper not running")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(d.helperRunning ? Color.green : Color.orange)
+                    .frame(width: 6, height: 6)
+                Text(d.helperRunning ? "Protecting" : "Offline")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(Color.primary.opacity(0.05), in: Capsule())
+        }
+    }
+
+    // MARK: hero
+
+    private var hero: some View {
+        VStack(spacing: 13) {
+            HStack(alignment: .center, spacing: 16) {
+                TempRing(temp: d.temp, tint: d.accent)
+
+                VStack(alignment: .leading, spacing: 9) {
+                    MetricRow(icon: "fanblades",
+                              label: "Fan",
+                              value: d.fan.map { "\(Int($0)) RPM" } ?? "—")
+                    MetricRow(icon: "speedometer",
+                              label: "Clock ceiling",
+                              value: d.clockText,
+                              tint: d.capActive ? Color.orange : Color.primary)
+                    MetricRow(icon: "battery.75",
+                              label: "Battery",
+                              value: d.batteryText)
+                    MetricRow(icon: "memorychip",
+                              label: "SMC",
+                              value: d.smcOK ? "connected" : "unavailable")
+                }
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 6) {
+                Chip(text: d.modeLabel, tint: d.accent, active: true)
+                Chip(text: d.capActive ? "Power cap on" : "Power cap off",
+                     tint: .orange, active: d.capActive)
+                if let l = d.limit, l < 100 {
+                    Chip(text: "macOS throttled \(l)%", tint: .red, active: true)
+                }
+                if d.mediaActive {
+                    Chip(text: d.mediaGuard ? "Call shielded" : "Call active",
+                         tint: .blue, active: true)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .cardSurface()
+    }
+
+    private var helperBanner: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 7) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                Text("Install the thermal helper to begin")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            Text("One privileged install. It reads the SMC thermometer and applies the power cap; nothing else on this Mac is touched.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !d.hint.isEmpty {
+                Text(d.hint)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.orange)
+            }
+            Button {
+                d.installHelper()
+            } label: {
+                Text("Install Thermal Helper…").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+        }
+        .cardSurface()
+    }
+
+    // MARK: controls
+
+    private var modeCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            CardTitle(icon: "thermometer.medium", text: "Cooling mode", trailing: d.modeLabel)
+            Picker("", selection: Binding(get: { d.mode }, set: { d.setMode($0) })) {
+                ForEach(modeValues, id: \.self) { v in
+                    Text(modeTitle(v)).tag(v)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Text(modeBlurb(d.mode))
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .cardSurface()
+    }
+
+    private var fanCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            CardTitle(icon: "fanblades", text: "Fan", trailing: fanTitle(d.fanIntent))
+            Picker("", selection: Binding(get: { d.fanIntent }, set: { d.setFan($0) })) {
+                ForEach(fanValues, id: \.self) { v in
+                    Text(fanTitle(v)).tag(v)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(!d.fanSupported)
+
+            if !d.fanNote.isEmpty {
+                Text(d.fanNote)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .cardSurface()
+    }
+
+    private var guardCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            CardTitle(icon: "video.badge.waveform", text: "Video & calls", trailing: d.guardTrailing)
+            Toggle("Shield video & call apps", isOn: Binding(get: { d.mediaGuard }, set: { d.setMediaGuard($0) }))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.system(size: 12, weight: .medium))
+
+            Text("While a real video or call runs, the power cap is released and nothing is demoted. Safety still wins above 84 °C.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !d.accelLines.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(d.accelLines.enumerated()), id: \.offset) { _, line in
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: line.hasPrefix("Fixed") ? "checkmark.circle.fill"
+                                  : (line.contains("hardware decode on") ? "checkmark.circle" : "exclamationmark.circle"))
+                                .font(.system(size: 10))
+                                .foregroundStyle(line.hasPrefix("Fixed") ? Color.green
+                                                 : (line.contains("hardware decode on") ? Color.secondary : Color.orange))
+                            Text(line)
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .padding(.top, 2)
+            }
+
+            if d.offerFix {
+                Button {
+                    d.fixAccelerationNow()
+                } label: {
+                    Text("Fix acceleration now…").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .cardSurface()
+    }
+
+    private var cpuCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            CardTitle(icon: "chart.bar.fill", text: "Using the CPU",
+                      trailing: d.demoted.isEmpty ? "" : "\(d.demoted.count) demoted")
+            if d.procs.isEmpty {
+                Text("Nothing significant is running.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(Array(d.procs.prefix(5).enumerated()), id: \.offset) { _, p in
+                    let name = p["name"] as? String ?? "?"
+                    let cpu = p["cpu"] as? Double ?? 0
+                    let pid = p["pid"] as? Int ?? 0
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            if d.demoted.contains(pid) {
+                                Image(systemName: "arrow.down.circle.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.blue)
+                                    .help("Demoted to background QoS — reversible, nothing is killed")
+                            }
+                            Text(name)
+                                .font(.system(size: 11))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 6)
+                            Text(String(format: "%.1f%%", cpu))
+                                .font(.system(size: 10.5, weight: .medium))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.primary.opacity(0.07))
+                                Capsule()
+                                    .fill(d.accent.opacity(0.75))
+                                    .frame(width: max(3, geo.size.width * min(cpu / 100.0, 1)))
+                            }
+                        }
+                        .frame(height: 4)
+                    }
+                    .padding(.vertical, 1)
+                }
+            }
+        }
+        .cardSurface()
+    }
+
+    private var eventsCard: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            CardTitle(icon: "clock.arrow.circlepath", text: "Recent activity")
+            ForEach(Array(d.events.suffix(4).enumerated()), id: \.offset) { _, e in
+                Text(e)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .cardSurface()
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            Button {
+                showSoftware = true
+            } label: {
+                Label("Software", systemImage: "shippingbox")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button {
+                showMacOS = true
+            } label: {
+                Label("macOS services", systemImage: "gearshape.2")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Spacer(minLength: 0)
+
+            Menu {
+                Toggle("Start at login", isOn: Binding(get: { d.loginOn }, set: { d.setLogin($0) }))
+                if !d.helperPresent {
+                    Button("Install Thermal Helper…") { d.installHelper() }
+                }
+                Divider()
+                Button("Quit ThermalGuard") { NSApp.terminate(nil) }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 13))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .frame(width: 30)
+            .help("More")
+        }
+        .padding(.top, 2)
+        .padding(.horizontal, 2)
+    }
+}
+
+// MARK: - Sheets
+
+struct SoftwareSheet: View {
+    @ObservedObject var d: AppDelegate
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirm: ConfirmAction?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SheetHeader(icon: "shippingbox",
+                        title: "Installed software",
+                        subtitle: "Third-party background items. Ticked = running. Apple services are hidden and never listed.")
+            Divider()
+            ScrollView {
+                VStack(spacing: 6) {
+                    if d.software.isEmpty {
+                        Text("No third-party background items found.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 20)
+                    }
+                    ForEach(Array(d.software.enumerated()), id: \.offset) { _, it in
+                        let label = it["label"] as? String ?? "?"
+                        let loaded = it["loaded"] as? Bool ?? false
+                        let scope = it["scope"] as? String ?? "system"
+                        ToggleRow(title: label,
+                                  subtitle: "\(scope) · \(it["path"] as? String ?? "")",
+                                  isOn: loaded) { on in
+                            if on {
+                                d.setAgent(label, enable: true)
+                            } else {
+                                confirm = ConfirmAction(
+                                    title: "Stop \(label)?",
+                                    message: "The vendor's background item is disabled until you re-tick it here. Reversible; nothing is deleted.",
+                                    confirmLabel: "Disable"
+                                ) { d.setAgent(label, enable: false) }
+                            }
+                        }
+                    }
+                }
+                .padding(16)
+            }
+            Divider()
+            HStack {
+                Text("Nothing is changed until you click.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+        }
+        .frame(width: 580, height: 540)
+        .onAppear { d.loadSoftware() }
+        .alert(item: $confirm) { c in
+            Alert(title: Text(c.title),
+                  message: Text(c.message),
+                  primaryButton: .destructive(Text(c.confirmLabel)) { c.run() },
+                  secondaryButton: .cancel())
+        }
+    }
+}
+
+struct MacOSSheet: View {
+    @ObservedObject var d: AppDelegate
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirm: ConfirmAction?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SheetHeader(icon: "gearshape.2",
+                        title: "macOS background services",
+                        subtitle: "macOS' own background work. Unticking is reversible: launchd services re-enable in one click, Spotlight and Power Nap use Apple's switches.")
+            Divider()
+            ScrollView {
+                VStack(spacing: 6) {
+                    if !d.macosNote.isEmpty {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Color.accentColor)
+                            Text(d.macosNote)
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(10)
+                        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    }
+                    ForEach(Array(d.macosItems.enumerated()), id: \.offset) { _, it in
+                        let id = it["id"] as? String ?? "?"
+                        let enabled = it["enabled"] as? Bool ?? false
+                        ToggleRow(title: id,
+                                  subtitle: it["desc"] as? String ?? "",
+                                  isOn: enabled) { on in
+                            if on {
+                                d.setMacOS(id, enable: true)
+                            } else {
+                                confirm = ConfirmAction(
+                                    title: "Turn off \(id)?",
+                                    message: "This stops that background job until you turn it back on here. Nothing is deleted and no system files are modified.",
+                                    confirmLabel: "Turn off"
+                                ) { d.setMacOS(id, enable: false) }
+                            }
+                        }
+                    }
+                }
+                .padding(16)
+            }
+            Divider()
+            HStack {
+                Text("Services protected by SIP will refuse and say so.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+        }
+        .frame(width: 600, height: 560)
+        .onAppear { d.loadMacOS() }
+        .alert(item: $confirm) { c in
+            Alert(title: Text(c.title),
+                  message: Text(c.message),
+                  primaryButton: .destructive(Text(c.confirmLabel)) { c.run() },
+                  secondaryButton: .cancel())
+        }
+    }
 }
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     var statusItem: NSStatusItem!
     var window: NSWindow?
     var timer: Timer?
 
-    // dashboard widgets
-    let tempLabel = NSTextField(labelWithString: "—")
-    let fanLabel = NSTextField(labelWithString: "fan —")
-    let stateLabel = NSTextField(labelWithString: "connecting…")
-    let hintLabel = NSTextField(wrappingLabelWithString: "")
-    let detailView = NSTextField(wrappingLabelWithString: "")
-    let modeLabels = ["Auto", "Off", "Balanced", "Cool & Quiet", "Max Cool"]
-    let modeValues = ["auto", "off", "balanced", "coolquiet", "maxcool"]
-    lazy var modeControl = NSSegmentedControl(labels: modeLabels,
-                                              trackingMode: .selectOne, target: nil, action: nil)
-    let fanLabels = ["SMC curve", "Silent", "Maximum"]
-    let fanValues = ["auto", "quiet", "max"]
-    lazy var fanControl = NSSegmentedControl(labels: fanLabels,
-                                             trackingMode: .selectOne, target: nil, action: nil)
-    let installButton = NSButton(title: "Install Thermal Helper…", target: nil, action: nil)
-    let loginButton = NSButton(checkboxWithTitle: "Start ThermalGuard at login", target: nil, action: nil)
-    let mediaCheck = NSButton(checkboxWithTitle: "Shield video & call apps (automatic: no throttling, no power cap below 84 °C)", target: nil, action: nil)
-    let accelLabel = NSTextField(wrappingLabelWithString: "")
-    let accelButton = NSButton(title: "Fix now…", target: nil, action: nil)
-    /// Apps that were seen decoding video / on a camera call while their
-    /// acceleration was off: the repair is owed, and lands when the call ends.
+    // Live machine state, published straight into SwiftUI.
+    @Published var helperRunning = false
+    @Published var helperPresent = false
+    @Published var loginOn = false
+    @Published var temp: Double?
+    @Published var fan: Double?
+    @Published var batt: Double?
+    @Published var ac = false
+    @Published var limit: Int?
+    @Published var turbo: Int?
+    @Published var lpm: Int?
+    @Published var capActive = false
+    @Published var mode = "auto"
+    @Published var modeLabel = "Auto"
+    @Published var fanIntent = "auto"
+    @Published var fanSupported = true
+    @Published var fanNote = ""
+    @Published var smcOK = false
+    @Published var mediaActive = false
+    @Published var mediaGuard = true
+    @Published var procs: [[String: Any]] = []
+    @Published var demoted: Set<Int> = []
+    @Published var events: [String] = []
+
+    // Acceleration guard
+    @Published var accelLines: [String] = []
+    @Published var offerFix = false
     var accelPending: Set<String> = []
     var accelNote = ""
-    let manageButton = NSButton(title: "Manage installed software…", target: nil, action: nil)
-    let macosButton = NSButton(title: "macOS background services…", target: nil, action: nil)
-    let quitButton = NSButton(title: "Quit", target: nil, action: nil)
 
-    var softwareWindow: NSWindow?
-    var softwareStack: NSStackView?
-    var agentItems: [[String: Any]] = []
+    @Published var hint = ""
+    @Published var software: [[String: Any]] = []
+    @Published var macosItems: [[String: Any]] = []
+    @Published var macosNote = ""
 
-    var macosWindow: NSWindow?
-    var macosStack: NSStackView?
-    var macosItems: [[String: Any]] = []
-    var macosNote = ""
+    /// One accent colour for the whole window, derived from the thermal state
+    /// so the UI reads at a glance: calm, warm, hot.
+    var accent: Color {
+        guard let t = temp else { return .gray }
+        if t >= 88 { return .red }
+        if t >= 80 { return .orange }
+        if t >= 68 { return .green }
+        return .teal
+    }
+
+    var headline: String {
+        guard let t = temp else { return "Waiting for the first reading…" }
+        if t >= 90 { return "Running hot — protecting the chip" }
+        if t >= 78 { return "Warm — shedding background load" }
+        if capActive { return "Capped to stay under the limit" }
+        return "Cool and running at full speed"
+    }
+
+    var clockText: String {
+        if capActive, let l = lpm { return String(format: "%.1f GHz capped", Double(l) / 1000) }
+        if let t = turbo { return String(format: "%.1f GHz turbo", Double(t) / 1000) }
+        return "—"
+    }
+
+    var batteryText: String {
+        let b = batt.map { String(format: "%.1f °C", $0) } ?? "—"
+        return "\(b) · \(ac ? "AC" : "battery")"
+    }
+
+    var guardTrailing: String {
+        if !mediaGuard { return "off" }
+        return mediaActive ? "protecting" : "watching"
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildStatusItem()
         buildWindow()
         refresh()
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
@@ -413,136 +1166,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: window
 
     func buildWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 640),
-                         styleMask: [.titled, .closable, .miniaturizable],
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 780),
+                         styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
                          backing: .buffered, defer: false)
-        w.title = "ThermalGuard — keep this Mac cool"
+        w.title = "ThermalGuard"
+        w.titleVisibility = .hidden
+        w.titlebarAppearsTransparent = true
+        w.isMovableByWindowBackground = true
+        w.backgroundColor = .clear
+        w.isOpaque = false
         w.center()
         w.isReleasedWhenClosed = false
+        w.contentMinSize = NSSize(width: 560, height: 560)
 
-        let bg = NSVisualEffectView()
-        bg.material = .underWindowBackground
-        bg.blendingMode = .behindWindow
-        bg.state = .active
-        w.contentView = bg
+        // Real window translucency: SwiftUI materials sit on top of this.
+        let fx = NSVisualEffectView()
+        fx.material = .underWindowBackground
+        fx.blendingMode = .behindWindow
+        fx.state = .active
+        fx.autoresizingMask = [.width, .height]
 
-        let title = NSTextField(labelWithString: "ThermalGuard")
-        title.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        let host = NSHostingView(rootView: RootView(d: self))
+        host.frame = fx.bounds
+        host.autoresizingMask = [.width, .height]
+        fx.addSubview(host)
 
-        tempLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 44, weight: .bold)
-        fanLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .regular)
-        stateLabel.font = NSFont.systemFont(ofSize: 12)
-        stateLabel.textColor = .secondaryLabelColor
-
-        modeControl.target = self
-        modeControl.action = #selector(modeChanged)
-        modeControl.selectedSegment = 0
-
-        fanControl.target = self
-        fanControl.action = #selector(fanChanged)
-        fanControl.selectedSegment = 0
-
-        installButton.target = self
-        installButton.action = #selector(installHelper)
-        installButton.bezelStyle = .rounded
-
-        loginButton.target = self
-        loginButton.action = #selector(toggleLogin)
-        loginButton.state = loginEnabled() ? .on : .off
-
-        mediaCheck.target = self
-        mediaCheck.action = #selector(mediaGuardChanged)
-        mediaCheck.state = .on
-
-        accelLabel.font = NSFont.systemFont(ofSize: 11)
-        accelLabel.textColor = .secondaryLabelColor
-        accelLabel.preferredMaxLayoutWidth = 500
-        accelButton.target = self
-        accelButton.action = #selector(fixAccelerationNow)
-        accelButton.bezelStyle = .rounded
-        accelButton.isHidden = true
-
-        manageButton.target = self
-        manageButton.action = #selector(openSoftware)
-        manageButton.bezelStyle = .rounded
-
-        macosButton.target = self
-        macosButton.action = #selector(openMacOS)
-        macosButton.bezelStyle = .rounded
-
-        quitButton.target = self
-        quitButton.action = #selector(quitApp)
-        quitButton.bezelStyle = .rounded
-
-        hintLabel.stringValue = ""
-        hintLabel.font = NSFont.systemFont(ofSize: 11)
-        hintLabel.textColor = .secondaryLabelColor
-        hintLabel.preferredMaxLayoutWidth = 500
-
-        detailView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        detailView.preferredMaxLayoutWidth = 500
-        detailView.isSelectable = true
-
-        let buttons = NSStackView(views: [installButton, manageButton, macosButton, loginButton, quitButton])
-        buttons.orientation = .horizontal
-        buttons.spacing = 8
-
-        let stack = NSStackView(views: [title, tempLabel, fanLabel, stateLabel,
-                                        modeControl, fanControl, mediaCheck, accelLabel, accelButton, hintLabel,
-                                        separator(), detailView, buttons])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        bg.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -20),
-            stack.topAnchor.constraint(equalTo: bg.topAnchor, constant: 20),
-            detailView.widthAnchor.constraint(equalTo: stack.widthAnchor),
-        ])
-        w.setContentSize(NSSize(width: 560, height: 660))
+        w.contentView = fx
         window = w
     }
 
-    func separator() -> NSBox {
-        let box = NSBox()
-        box.boxType = .separator
-        box.translatesAutoresizingMaskIntoConstraints = false
-        box.widthAnchor.constraint(equalToConstant: 500).isActive = true
-        return box
-    }
+    // MARK: actions from the UI
 
-    // MARK: actions
-
-    @objc func modeChanged() {
-        // Only react to a real click. Programmatic segment updates during
-        // refresh() must never push a mode back to the daemon.
-        guard NSApp.currentEvent != nil else { return }
-        let i = modeControl.selectedSegment
-        if i >= 0 && i < modeValues.count { sendMode(modeValues[i]) }
+    func setMode(_ value: String) {
+        sendMode(value)
+        mode = value
         refresh()
     }
 
-    @objc func fanChanged() {
-        // Same rule as the mode control: ignore programmatic updates.
-        guard NSApp.currentEvent != nil else { return }
-        let i = fanControl.selectedSegment
-        if i >= 0 && i < fanValues.count { sendFan(fanValues[i]) }
+    func setFan(_ value: String) {
+        sendFan(value)
+        fanIntent = value
         refresh()
     }
 
-    @objc func mediaGuardChanged() {
-        guard NSApp.currentEvent != nil else { return }
-        let on = mediaCheck.state == .on
+    func setMediaGuard(_ on: Bool) {
+        mediaGuard = on
         _ = sendRequest("{\"cmd\":\"media_guard\",\"value\":\"\(on ? "on" : "off")\"}")
         refresh()
     }
 
     /// User override for the one case the guard must not take itself: a repair
     /// that needs the app restarted while a call or video is running.
-    @objc func fixAccelerationNow() {
+    func fixAccelerationNow() {
         let sample = cpuSample()
         for app in acceleratedApps {
             let s = accelStatus(app, sample: sample)
@@ -566,7 +1241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sample = cpuSample()
         let pulse = mediaPulse(sample: sample)
         var lines: [String] = []
-        var offerFix = false
+        var offer = false
 
         for app in acceleratedApps {
             let s = accelStatus(app, sample: sample)
@@ -584,11 +1259,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if s.enabled {
                     lines.append("\(app.name): hardware decode on")
                 } else {
-                    lines.append("\(app.name): acceleration off, waiting for a video or call to fix it")
+                    lines.append("\(app.name): acceleration off, waiting for a video or call")
                 }
             case .hold(let why):
                 lines.append("\(app.name): acceleration off — \(why)")
-                offerFix = pulse.active
+                offer = pulse.active
             case .enableNow(let relaunch):
                 let (ok, msg) = enableAcceleration(app, relaunch: relaunch)
                 if ok {
@@ -596,243 +1271,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     lines.append("Fixed: \(msg)")
                 } else {
                     lines.append("\(app.name): \(msg)")
-                    offerFix = true
+                    offer = true
                 }
             }
         }
 
         if !accelNote.isEmpty { lines.append(accelNote) }
-        accelLabel.stringValue = lines.joined(separator: "\n")
-        accelButton.isHidden = !offerFix
+        accelLines = lines
+        offerFix = offer
         accelNote = ""
     }
 
-    @objc func quitApp() { NSApp.terminate(nil) }
+    // MARK: installed software
 
-    // MARK: installed software (user decides)
-
-    @objc func openSoftware() {
-        if softwareWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 540),
-                             styleMask: [.titled, .closable, .resizable],
-                             backing: .buffered, defer: false)
-            w.title = "Installed software — your call"
-            w.center()
-            w.isReleasedWhenClosed = false
-
-            let scroll = NSScrollView()
-            scroll.hasVerticalScroller = true
-            scroll.drawsBackground = false
-            let doc = FlippedView(frame: NSRect(x: 0, y: 0, width: 620, height: 200))
-            let stack = NSStackView()
-            stack.orientation = .vertical
-            stack.alignment = .leading
-            stack.spacing = 7
-            stack.translatesAutoresizingMaskIntoConstraints = false
-            doc.addSubview(stack)
-            NSLayoutConstraint.activate([
-                stack.topAnchor.constraint(equalTo: doc.topAnchor, constant: 14),
-                stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 14),
-                stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -14),
-            ])
-            scroll.documentView = doc
-            w.contentView = scroll
-            softwareWindow = w
-            softwareStack = stack
-        }
-        refreshSoftware()
-        softwareWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    func refreshSoftware() {
-        guard let stack = softwareStack,
-              let raw = sendRequest("{\"cmd\":\"agents\"}"),
+    func loadSoftware() {
+        guard let raw = sendRequest("{\"cmd\":\"agents\"}"),
               let d = raw.data(using: .utf8),
               let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
               let items = obj["items"] as? [[String: Any]]
         else { return }
-        agentItems = items
-
-        for v in stack.arrangedSubviews {
-            stack.removeArrangedSubview(v)
-            v.removeFromSuperview()
-        }
-
-        let header = NSTextField(wrappingLabelWithString:
-            "Third‑party background items installed on this Mac. Ticked = running. "
-            + "Untick to stop one (you are asked to confirm). Nothing here is changed "
-            + "until you click, and everything can be re‑ticked. Apple services are hidden "
-            + "and cannot be changed.")
-        header.font = NSFont.systemFont(ofSize: 11)
-        header.textColor = .secondaryLabelColor
-        header.preferredMaxLayoutWidth = 580
-        stack.addArrangedSubview(header)
-
-        if items.isEmpty {
-            stack.addArrangedSubview(NSTextField(labelWithString: "No third‑party background items found."))
-        }
-
-        for (idx, it) in items.enumerated() {
-            let label = it["label"] as? String ?? "?"
-            let loaded = it["loaded"] as? Bool ?? false
-            let scope = it["scope"] as? String ?? "system"
-            let b = NSButton(checkboxWithTitle: label, target: self, action: #selector(toggleAgent(_:)))
-            b.tag = idx
-            b.state = loaded ? .on : .off
-            b.toolTip = "\(scope) · \(it["path"] as? String ?? "")"
-            stack.addArrangedSubview(b)
-        }
-
-        if let doc = stack.superview {
-            let h = stack.fittingSize.height + 28
-            doc.frame = NSRect(x: 0, y: 0, width: 620, height: max(h, 200))
-        }
+        software = items
     }
 
-    @objc func toggleAgent(_ sender: NSButton) {
-        let i = sender.tag
-        guard i < agentItems.count else { return }
-        let it = agentItems[i]
-        let label = it["label"] as? String ?? ""
-        let want = sender.state == .on
-
-        if !want {
-            let a = NSAlert()
-            a.messageText = "Stop \(label)?"
-            a.informativeText = "The vendor's background item will be disabled until you re‑tick it here. "
-                + "This is reversible and nothing is deleted."
-            a.addButton(withTitle: "Disable")
-            a.addButton(withTitle: "Cancel")
-            if a.runModal() != .alertFirstButtonReturn {
-                sender.state = .on
-                return
-            }
-        }
-
-        // Label only: the daemon re-derives path and scope itself, so the UI
-        // cannot be used to point launchctl at an arbitrary file.
-        _ = sendRequest("{\"cmd\":\"agent\",\"label\":\"\(label)\",\"enable\":\(want)}")
-        refreshSoftware()
+    /// Label only: the daemon re-derives path and scope itself, so the UI
+    /// cannot be used to point launchctl at an arbitrary file.
+    func setAgent(_ label: String, enable: Bool) {
+        _ = sendRequest("{\"cmd\":\"agent\",\"label\":\"\(label)\",\"enable\":\(enable)}")
+        loadSoftware()
     }
 
-    // MARK: macOS background services (user decides)
+    // MARK: macOS background services
 
-    @objc func openMacOS() {
-        if macosWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 560),
-                             styleMask: [.titled, .closable, .resizable],
-                             backing: .buffered, defer: false)
-            w.title = "macOS background services — your call"
-            w.center()
-            w.isReleasedWhenClosed = false
-
-            let scroll = NSScrollView()
-            scroll.hasVerticalScroller = true
-            scroll.drawsBackground = false
-            let doc = FlippedView(frame: NSRect(x: 0, y: 0, width: 640, height: 300))
-            let stack = NSStackView()
-            stack.orientation = .vertical
-            stack.alignment = .leading
-            stack.spacing = 10
-            stack.translatesAutoresizingMaskIntoConstraints = false
-            doc.addSubview(stack)
-            NSLayoutConstraint.activate([
-                stack.topAnchor.constraint(equalTo: doc.topAnchor, constant: 14),
-                stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 14),
-                stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -14),
-            ])
-            scroll.documentView = doc
-            w.contentView = scroll
-            macosWindow = w
-            macosStack = stack
-        }
-        refreshMacOS()
-        macosWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    func refreshMacOS() {
-        guard let stack = macosStack,
-              let raw = sendRequest("{\"cmd\":\"apple\"}"),
+    func loadMacOS() {
+        guard let raw = sendRequest("{\"cmd\":\"apple\"}"),
               let d = raw.data(using: .utf8),
               let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
               let items = obj["items"] as? [[String: Any]]
         else { return }
         macosItems = items
         macosNote = obj["note"] as? String ?? ""
-
-        for v in stack.arrangedSubviews {
-            stack.removeArrangedSubview(v)
-            v.removeFromSuperview()
-        }
-
-        let header = NSTextField(wrappingLabelWithString:
-            "macOS' own background work. Unticking is reversible and never deletes anything: "
-            + "launchd services are re-enabled with one click, Spotlight and Power Nap use "
-            + "Apple's own switches. Services protected by SIP will refuse and say so.")
-        header.font = NSFont.systemFont(ofSize: 11)
-        header.textColor = .secondaryLabelColor
-        header.preferredMaxLayoutWidth = 600
-        stack.addArrangedSubview(header)
-
-        if !macosNote.isEmpty {
-            let note = NSTextField(wrappingLabelWithString: macosNote)
-            note.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            note.textColor = .systemBlue
-            note.preferredMaxLayoutWidth = 600
-            stack.addArrangedSubview(note)
-        }
-
-        for (idx, it) in items.enumerated() {
-            let id = it["id"] as? String ?? "?"
-            let enabled = it["enabled"] as? Bool ?? false
-            let desc = it["desc"] as? String ?? ""
-            let row = NSStackView()
-            row.orientation = .vertical
-            row.alignment = .leading
-            row.spacing = 1
-
-            let b = NSButton(checkboxWithTitle: id, target: self, action: #selector(toggleMacOS(_:)))
-            b.tag = idx
-            b.state = enabled ? .on : .off
-            let sub = NSTextField(wrappingLabelWithString: desc)
-            sub.font = NSFont.systemFont(ofSize: 10)
-            sub.textColor = .tertiaryLabelColor
-            sub.preferredMaxLayoutWidth = 580
-
-            row.addArrangedSubview(b)
-            row.addArrangedSubview(sub)
-            stack.addArrangedSubview(row)
-        }
-
-        if let doc = stack.superview {
-            let h = stack.fittingSize.height + 28
-            doc.frame = NSRect(x: 0, y: 0, width: 640, height: max(h, 300))
-        }
     }
 
-    @objc func toggleMacOS(_ sender: NSButton) {
-        let i = sender.tag
-        guard i < macosItems.count else { return }
-        let id = macosItems[i]["id"] as? String ?? ""
-        let want = sender.state == .on
-
-        if !want {
-            let a = NSAlert()
-            a.messageText = "Turn off \(id)?"
-            a.informativeText = "This stops that background job until you turn it back on here. "
-                + "Nothing is deleted and no system files are modified."
-            a.addButton(withTitle: "Turn off")
-            a.addButton(withTitle: "Cancel")
-            if a.runModal() != .alertFirstButtonReturn {
-                sender.state = .on
-                return
-            }
-        }
-
-        _ = sendRequest("{\"cmd\":\"apple_set\",\"id\":\"\(id)\",\"enable\":\(want)}")
-        refreshMacOS()
+    func setMacOS(_ id: String, enable: Bool) {
+        _ = sendRequest("{\"cmd\":\"apple_set\",\"id\":\"\(id)\",\"enable\":\(enable)}")
+        loadMacOS()
     }
 
     /// POSIX shell single-quote escaping, so a path can never break out of the
@@ -841,9 +1323,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    @objc func installHelper() {
+    func installHelper() {
         guard let script = Bundle.main.path(forResource: "install-helper", ofType: "sh") else {
-            hintLabel.stringValue = "install-helper.sh missing from the app bundle."
+            hint = "install-helper.sh missing from the app bundle."
             return
         }
         let cmd = "/bin/sh \(shellQuote(script)) \(shellQuote(Bundle.main.bundlePath))"
@@ -854,9 +1336,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let apple = NSAppleScript(source: source) {
             apple.executeAndReturnError(&err)
             if let e = err {
-                hintLabel.stringValue = "Installer error: \(e[NSAppleScript.errorMessage] ?? "unknown")"
+                hint = "Installer error: \(e[NSAppleScript.errorMessage] ?? "unknown")"
             } else {
-                hintLabel.stringValue = "Helper installed. Thermal protection is active."
+                hint = "Helper installed. Thermal protection is active."
             }
         }
         refresh()
@@ -873,9 +1355,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         FileManager.default.fileExists(atPath: loginPlistPath())
     }
 
-    @objc func toggleLogin() {
+    func setLogin(_ on: Bool) {
         let path = loginPlistPath()
-        if loginButton.state == .on {
+        if on {
             // Serialised, not string-built: no XML-injection surface in the path.
             let dictionary: [String: Any] = [
                 "Label": "com.thermalguard.app",
@@ -891,115 +1373,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = shell("/bin/launchctl", ["bootout", "gui/\(getuid())/com.thermalguard.app"])
             try? FileManager.default.removeItem(atPath: path)
         }
+        loginOn = loginEnabled()
     }
 
     // MARK: refresh
 
     func refresh() {
         refreshAccelerationGuard()
-        guard let s = requestStatus() else {
-            statusItem.button?.title = "—°"
-            stateLabel.stringValue = "Thermal helper not running"
-            installButton.isEnabled = true
-            modeControl.isEnabled = false
-            detailView.stringValue = """
-            The privileged helper is not installed or not running.
+        helperPresent = helperInstalled()
+        loginOn = loginEnabled()
 
-            Click “Install Thermal Helper…” once. It installs a small root
-            daemon that reads the SMC thermometer and applies the power cap.
-            After that, this window shows live data.
-            """
+        guard let s = requestStatus() else {
+            helperRunning = false
+            statusItem?.button?.title = "—°"
+            temp = nil
+            fan = nil
             return
         }
+        helperRunning = true
 
-        modeControl.isEnabled = true
-        installButton.isEnabled = false
+        temp = s["cpu_temp"] as? Double
+        fan = s["fan_rpm"] as? Double
+        batt = s["battery_temp"] as? Double
+        ac = s["ac_power"] as? Bool ?? false
+        limit = s["speed_limit"] as? Int
+        turbo = s["turbo_mhz"] as? Int
+        lpm = s["lpm_mhz"] as? Int
+        capActive = s["cap_active"] as? Bool ?? false
+        modeLabel = s["mode_label"] as? String ?? "Auto"
+        smcOK = s["smc_ok"] as? Bool ?? false
+        mediaActive = s["media_active"] as? Bool ?? false
+        if let g = s["media_guard"] as? Bool { mediaGuard = g }
+        procs = s["procs"] as? [[String: Any]] ?? []
+        events = s["events"] as? [String] ?? []
+        fanSupported = s["fan_supported"] as? Bool ?? true
+        fanNote = s["fan_note"] as? String ?? ""
+        if let m = s["mode"] as? String, m != mode { mode = m }
+        if let f = s["fan_intent"] as? String, f != fanIntent { fanIntent = f }
 
-        let temp = s["cpu_temp"] as? Double
-        let fan = s["fan_rpm"] as? Double
-        let limit = s["speed_limit"] as? Int
-        let mode = s["mode"] as? String ?? "balanced"
-        let capActive = s["cap_active"] as? Bool ?? false
-        let fanSupported = s["fan_supported"] as? Bool
-        let fanNote = s["fan_note"] as? String ?? ""
-        let smcOK = s["smc_ok"] as? Bool ?? false
-        let smcErr = s["smc_error"] as? String ?? ""
-        let batt = s["battery_temp"] as? Double
-        let ac = s["ac_power"] as? Bool ?? false
-        let turbo = s["turbo_mhz"] as? Int
-        let lpm = s["lpm_mhz"] as? Int
-        let procs = s["procs"] as? [[String: Any]] ?? []
-        let demoted = s["demoted"] as? [[String: Any]] ?? []
-        let events = s["events"] as? [String] ?? []
+        // A disappeared PID must not linger in the demoted set — it would put a
+        // stale down-arrow next to an unrelated process that reused the pid.
+        let live = Set(procs.compactMap { $0["pid"] as? Int })
+        var flagged = Set<Int>()
+        for p in s["demoted"] as? [[String: Any]] ?? [] {
+            if let pid = p["pid"] as? Int, live.contains(pid) { flagged.insert(pid) }
+        }
+        demoted = flagged
 
         if let t = temp {
-            let shown = Int(t.rounded())
-            statusItem.button?.title = "\(shown)°"
-            tempLabel.stringValue = "\(shown)°C"
-            tempLabel.textColor = t >= 90 ? .systemRed : (t >= 78 ? .systemOrange : .labelColor)
+            statusItem?.button?.title = "\(Int(t.rounded()))°"
         } else {
-            statusItem.button?.title = "–°"
-            tempLabel.stringValue = "n/a"
-            tempLabel.textColor = .secondaryLabelColor
+            statusItem?.button?.title = "–°"
         }
-
-        var fanLine = "fan "
-        if let f = fan { fanLine += "\(Int(f)) RPM" } else { fanLine += "unknown" }
-        fanLabel.stringValue = fanLine
-
-        let modeIdx = modeValues.firstIndex(of: mode) ?? 0
-        if modeControl.selectedSegment != modeIdx { modeControl.selectedSegment = modeIdx }
-
-        var stateBits: [String] = []
-        stateBits.append(s["mode_label"] as? String ?? mode)
-        stateBits.append(capActive ? "power cap ON" : "power cap off")
-        if let l = limit, l < 100 { stateBits.append("OS throttling (\(l)%)") }
-        stateBits.append(ac ? "on AC" : "on battery")
-        if (s["media_active"] as? Bool) == true {
-            stateBits.append((s["media_guard"] as? Bool) == true ? "call/video shielded" : "call/video active")
-        }
-        if let g = s["media_guard"] as? Bool, (g ? .on : .off) != mediaCheck.state {
-            mediaCheck.state = g ? .on : .off
-        }
-        stateLabel.stringValue = stateBits.joined(separator: " · ")
-
-        let fanIntent = s["fan_intent"] as? String ?? "auto"
-        let fanIdx = fanValues.firstIndex(of: fanIntent) ?? 0
-        if fanControl.selectedSegment != fanIdx { fanControl.selectedSegment = fanIdx }
-        // Only "Maximum" is known-unsupported by a model; "Silent" is worth
-        // offering because the SMC either accepts it or reports it back plainly.
-        if fanSupported == false && fanIdx == 0 { fanControl.isEnabled = false } else { fanControl.isEnabled = true }
-
-        hintLabel.stringValue = fanNote.isEmpty ? "" : fanNote
-
-        var lines: [String] = []
-        lines.append("CPU   \(temp.map { String(format: "%.1f °C", $0) } ?? "n/a")   Battery \(batt.map { String(format: "%.1f °C", $0) } ?? "n/a")")
-        lines.append("SMC   \(smcOK ? "connected" : "unavailable — \(smcErr)")")
-        if let turbo, let lpm {
-            lines.append("Clock ceiling  \(capActive ? "\(lpm/1000).\((lpm%1000)/100) GHz (capped)" : "\(turbo/1000).\((turbo%1000)/100) GHz (turbo)")")
-        }
-        lines.append("")
-        lines.append("WHAT IS USING THE CPU")
-        if procs.isEmpty {
-            lines.append("  (none sampled)")
-        }
-        for p in procs.prefix(7) {
-            let name = p["name"] as? String ?? "?"
-            let cpu = p["cpu"] as? Double ?? 0
-            let pid = p["pid"] as? Int ?? 0
-            let mark = demoted.contains(where: { ($0["pid"] as? Int) == pid }) ? "↓" : " "
-            lines.append(String(format: "  %@ %5.1f%%  %@", mark, cpu, name))
-        }
-        if !demoted.isEmpty {
-            lines.append("")
-            lines.append("↓ = demoted to background QoS (reversible, nothing is killed)")
-        }
-        lines.append("")
-        lines.append("RECENT EVENTS")
-        for e in events.suffix(5) {
-            lines.append("  \(e)")
-        }
-        detailView.stringValue = lines.joined(separator: "\n")
     }
 }
 
