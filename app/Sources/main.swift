@@ -1934,6 +1934,11 @@ struct RootView: View {
 
             Spacer(minLength: 0)
 
+            Text("v\(d.appVersion)")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
             Menu {
                 Toggle("Start at login", isOn: Binding(get: { d.loginOn }, set: { d.setLogin($0) }))
                 if !d.helperPresent {
@@ -2243,6 +2248,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var autoTrim = false
     @Published var autoTrimActive = false
     @Published var autoTrimNote = ""
+
+    /// The version read from the bundle at launch.
+    let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
 
     /// One accent colour for the whole window, derived from the thermal state
     /// so the UI reads at a glance: calm, warm, hot.
