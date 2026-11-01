@@ -1788,6 +1788,12 @@ struct RootView: View {
                 .padding(.top, 1)
             }
 
+            if d.memoryTrend >= 0.5 {
+                Text(String(format: "Compressor growing %.1f MB/s — reclaiming before it bites", d.memoryTrend))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+            }
+
             if !d.memoryReclaimNote.isEmpty {
                 Text(d.memoryReclaimNote)
                     .font(.system(size: 10.5))
@@ -2143,6 +2149,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var memoryReclaimNote = ""
     @Published var memoryReclaims = 0
     @Published var memoryReclaimable = 0.0
+    @Published var memoryAdvice = "hold"
+    @Published var memoryTrend = 0.0
     var lastMemoryScan: Date?
     var lastChromeScan: Date?
 
@@ -2523,7 +2531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         memoryCompressed = stats.totalMB > 0
             ? String(format: "%.1f GB", stats.compressedMB / 1024.0)
             : "—"
-        memoryPressure = stats.pressure.rawValue
+        if !helperRunning { memoryPressure = stats.pressure.rawValue }
         memoryTop = topMemoryApps(3)
 
         guard memoryGuard else { memoryStatus = "off"; return }
@@ -2901,6 +2909,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         memoryReclaimNote = s["memory_note"] as? String ?? ""
         memoryReclaims = s["memory_reclaims"] as? Int ?? 0
         memoryReclaimable = s["memory_reclaimable_mb"] as? Double ?? 0
+        memoryAdvice = s["memory_advice"] as? String ?? "hold"
+        memoryTrend = s["memory_trend_mb_s"] as? Double ?? 0
+        // The daemon samples the kernel's own VM counters every 2 s; trust that
+        // verdict over the UI's coarser reading when the helper is running.
+        if let p = s["memory_pressure"] as? String, helperRunning { memoryPressure = p }
 
         // The three user-space guards are heavier than reading daemon status,
         // so each runs on its own cadence. Chrome is checked often enough to

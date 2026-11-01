@@ -63,12 +63,14 @@ Reinstalling macOS does not change #1 or #2 — they are design, not corruption.
   Before any app is touched the daemon measures the compressor, swap and the
   reclaimable (purgeable + file-backed) cache, and it takes its pressure band
   from the kernel's own verdict (`kern.memorystatus_vm_pressure_level`) rather
-  than a free-page percentage — macOS keeps free pages low on purpose. Only when
-  the kernel reports warning/critical pressure, at least 1 GB is reclaimable and
-  swap is below 70 % does it release that cache with one verified `purge` —
-  30-minute cooldown, at most twice an hour, never in Off mode. So the order is:
-  let the kernel compress and swap, drop cache we can actually prove is
-  reclaimable, and only then ask idle apps to quit.
+  than a free-page percentage — macOS keeps free pages low on purpose. Sampling
+  goes through Mach directly (`host_statistics64` + `sysctlbyname`, no
+  `vm_stat`/`sysctl` children) and costs ~15 µs, so it runs on every 2 s tick.
+  The compressor/swap **trend** is tracked over a 20 s window, so a machine
+  climbing into pressure is visible before it is critical. The ladder is:
+  kernel compresses and swaps → drop cache we can prove is reclaimable (≥ 1 GB,
+  swap < 70 %, 30-minute cooldown, twice an hour, never in Off mode) → only then
+  ask idle apps to quit.
 - **Reduced animations & visual effects** (default on, every mode except Off):
   writes the three macOS switches that cost the Intel Iris Plus the most —
   Reduce Motion, Reduce Transparency and automatic window animations — and puts
@@ -186,8 +188,8 @@ and `MD5SUMS`. Verify the download before opening it:
 
 ```bash
 cd ~/Downloads
-shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.5.0.dmg
-md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.5.0.dmg
+shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.6.0.dmg
+md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.6.0.dmg
 ```
 
 ## Local setup
@@ -228,8 +230,8 @@ Publishing is tag-driven (`.github/workflows/release.yml`). Bump
 `app/Info.plist`, then:
 
 ```bash
-git tag -a v1.5.0 -m "ThermalGuard 1.5.0"   # the tag message becomes the release notes
-git push origin v1.5.0
+git tag -a v1.6.0 -m "ThermalGuard 1.6.0"   # the tag message becomes the release notes
+git push origin v1.6.0
 ```
 
 CI runs the test suite, rebuilds from that commit, and attaches the DMG,
@@ -239,8 +241,9 @@ CI runs the test suite, rebuilds from that commit, and attaches the DMG,
 
 ```bash
 cd daemon
-cargo test              # unit + integration (IPC) suite
+cargo test              # 81 unit + 24 integration (IPC) tests
 cargo test --release    # same, optimised build
+cargo run --release -- --memory-probe   # one Mach VM sample + µs per sample
 ```
 
 What the suite covers: policy hysteresis and mode switching, the
@@ -314,9 +317,12 @@ Small wins that are worth doing by hand:
   `/var/run/thermalguard.sock` (mode 0666, root‑owned service). Per-user
   preferences (animations, transparency) are therefore written by the UI only;
   the root daemon never needs to reach into a user's defaults.
-- `policy.rs`, `trim.rs` and `audio.rs` are pure functions; all side effects
-  live in `system.rs` / `procs.rs`, so the decision logic is testable without
-  hardware — including "may this audio engine be reset?"
+- `policy.rs`, `trim.rs`, `audio.rs` and `memory.rs` are pure functions; all
+  side effects live in `system.rs` / `procs.rs`, so the decision logic is
+  testable without hardware or memory pressure.
+- The memory sampler is the one hot path written like driver code: direct Mach
+  and `sysctlbyname` FFI, no process spawns, ~15 µs per sample. It only ever
+  **reads** kernel counters; the VM subsystem itself stays Apple's.
 - Hysteresis on the cap (82 → 72 °C) prevents mode flapping.
 - Every write is verified: fan target by read‑back, power cap by re‑reading
   `pmset -g custom`, demotion by return value. Failures are logged, not hidden.

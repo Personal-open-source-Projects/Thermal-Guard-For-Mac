@@ -126,6 +126,8 @@ struct Shared {
     memory_last: Option<Instant>,
     memory_window: Vec<Instant>,
     memory_note: String,
+    memory_advice: memory::Advice,
+    memory_trend: memory::Trend,
     /// User setting: opt-in trimmer for auto-safe macOS background services.
     auto_trim: bool,
     /// Services *we* disabled and therefore may restore. Never includes a
@@ -186,6 +188,8 @@ impl Default for Shared {
             memory_last: None,
             memory_window: Vec::new(),
             memory_note: String::new(),
+            memory_advice: memory::Advice::Hold,
+            memory_trend: memory::Trend::default(),
             auto_trim: false,
             auto_trimmed: Vec::new(),
             auto_trim_note: String::new(),
@@ -350,6 +354,11 @@ fn state_json(sh: &Shared) -> String {
         json::n("memory_reclaimable_mb", sh.mem_reclaimable_mb.round()),
         json::n("memory_swap_used_pct", (sh.mem_swap_used_pct * 10.0).round() / 10.0),
         json::i("memory_reclaims", sh.memory_reclaims as i64),
+        json::s("memory_advice", sh.memory_advice.as_str()),
+        json::n(
+            "memory_trend_mb_s",
+            (sh.memory_trend.compressed_mb_per_s * 10.0).round() / 10.0,
+        ),
         json::s("memory_note", &sh.memory_note),
         json::b("auto_trim", sh.auto_trim),
         json::b("auto_trim_active", sh.auto_trim && sh.mode == Mode::Auto),
@@ -1109,7 +1118,32 @@ fn smc_holder() -> Option<smc::Smc> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        println!("thermalguardd 1.5.0");
+        println!("thermalguardd 1.6.0");
+        return;
+    }
+    if args.iter().any(|a| a == "--memory-probe") {
+        let n = 200u32;
+        let started = Instant::now();
+        let mut last = None;
+        for _ in 0..n {
+            last = system::memory_stats();
+        }
+        let avg_us = started.elapsed().as_secs_f64() * 1e6 / n as f64;
+        match last {
+            Some(m) => println!(
+                "{{\"total_mb\":{:.0},\"free_mb\":{:.0},\"compressed_mb\":{:.0},\"reclaimable_mb\":{:.0},\"swap_used_mb\":{:.0},\"swap_total_mb\":{:.0},\"swap_used_pct\":{:.1},\"kernel_pressure\":{},\"avg_us\":{:.1}}}",
+                m.total_mb,
+                m.free_mb,
+                m.compressed_mb,
+                m.reclaimable_mb,
+                m.swap_used_mb,
+                m.swap_total_mb,
+                m.swap_used_pct,
+                m.kernel_pressure.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+                avg_us
+            ),
+            None => println!("{{\"error\":\"memory stats unreadable\"}}"),
+        }
         return;
     }
     if args.iter().any(|a| a == "--probe") {
@@ -1248,7 +1282,9 @@ fn main() {
 
     // Main control loop.
     let mut last_demote_scan = Instant::now() - Duration::from_secs(10);
-    let mut last_mem_scan = Instant::now() - Duration::from_secs(10);
+    let mut last_mem_scan = Instant::now() - Duration::from_secs(2);
+    // Short ring of Mach samples used for the compressor/swap trend.
+    let mut mem_samples: Vec<(Instant, f64, f64)> = Vec::new();
     let mut logged_cap = false;
     // When the power cap last changed hands, so the Auto governor can enforce
     // its dwell time and cannot flap every tick.
@@ -1291,12 +1327,25 @@ fn main() {
 
         // Memory is sampled slower than the CPU: the compressor moves on the
         // order of seconds, and this is two extra process spawns.
-        let mem = if last_mem_scan.elapsed() >= Duration::from_secs(10) {
+        // Mach-level sampling: one syscall, no child processes, so this runs on
+        // every tick instead of every tenth.
+        let mem = if last_mem_scan.elapsed() >= Duration::from_secs(2) {
             last_mem_scan = Instant::now();
             system::memory_stats()
         } else {
             None
         };
+        if let Some(m) = mem {
+            mem_samples.push((Instant::now(), m.compressed_mb, m.swap_used_mb));
+        }
+        mem_samples.retain(|(t, _, _)| t.elapsed().as_secs_f64() < memory::TREND_WINDOW_S + 5.0);
+        let mem_trend = memory::trend(
+            &mem_samples
+                .iter()
+                .map(|(t, c, s)| (t.elapsed().as_secs_f64(), *c, *s))
+                .collect::<Vec<(f64, f64, f64)>>(),
+            memory::TREND_WINDOW_S,
+        );
 
         let inputs: Vec<(u32, String, f64)> = procs_sample
             .iter()
@@ -1443,6 +1492,12 @@ fn main() {
                 sh.mem_swap_used_pct = m.swap_used_pct;
             }
             sh.memory_window.retain(|t| t.elapsed().as_secs() < 3600);
+            sh.memory_trend = mem_trend;
+            sh.memory_advice = memory::advice(
+                sh.mem_pressure,
+                sh.mem_reclaimable_mb,
+                sh.mem_swap_used_pct,
+            );
             let inputs = memory::Inputs {
                 enabled: sh.memory_reclaim,
                 mode_off: sh.mode == Mode::Off,

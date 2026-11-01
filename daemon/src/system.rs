@@ -3,6 +3,7 @@
 //! Every child process is invoked by absolute path so a modified `PATH` cannot
 //! redirect a root daemon to an attacker-controlled binary.
 
+use std::os::raw::{c_char, c_int, c_void};
 use std::process::Command;
 
 const PMSET: &str = "/usr/bin/pmset";
@@ -12,7 +13,6 @@ const DATE: &str = "/bin/date";
 const STAT: &str = "/usr/bin/stat";
 const KILLALL: &str = "/usr/bin/killall";
 const PGREP: &str = "/usr/bin/pgrep";
-const VM_STAT: &str = "/usr/bin/vm_stat";
 const PURGE: &str = "/usr/bin/purge";
 
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
@@ -139,78 +139,154 @@ pub fn on_ac_power() -> bool {
         .unwrap_or(false)
 }
 
-/// A snapshot of what the kernel reports about memory. Everything here is
-/// measured, never inferred: the app only decides what to do with it.
+/// A snapshot of what the kernel reports about memory, read through Mach and
+/// `sysctlbyname` directly.
+///
+/// This is the hot path: one `host_statistics64` call plus three sysctls, all
+/// in-process. No `vm_stat` or `sysctl` child is spawned, so a sample costs
+/// microseconds instead of milliseconds and can run on every daemon tick.
 #[derive(Clone, Copy, Debug)]
 pub struct MemStats {
     pub total_mb: f64,
+    /// Free plus speculative pages: memory available without reclaim.
     pub free_mb: f64,
     pub compressed_mb: f64,
-    /// Purgeable + file-backed pages: cache the kernel can drop on demand.
+    /// Purgeable + file-backed (external) pages: cache the kernel can drop.
     pub reclaimable_mb: f64,
+    pub swap_used_mb: f64,
+    pub swap_total_mb: f64,
     pub swap_used_pct: f64,
     /// `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
-    /// This is the kernel's own verdict and outranks any page heuristic.
     pub kernel_pressure: Option<u8>,
 }
 
-fn pages(text: &str, key: &str) -> Option<f64> {
-    for line in text.lines() {
-        let (name, rest) = line.split_once(':')?;
-        if name.trim() == key {
-            return rest.trim().trim_end_matches('.').parse::<f64>().ok();
-        }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VmStatistics64 {
+    free_count: u32,
+    active_count: u32,
+    inactive_count: u32,
+    wire_count: u32,
+    zero_fill_count: u64,
+    reactivations: u64,
+    pageins: u64,
+    pageouts: u64,
+    faults: u64,
+    cow_faults: u64,
+    lookups: u64,
+    hits: u64,
+    purges: u64,
+    purgeable_count: u32,
+    speculative_count: u32,
+    decompressions: u64,
+    compressions: u64,
+    swapins: u64,
+    swapouts: u64,
+    compressor_page_count: u32,
+    throttled_count: u32,
+    external_page_count: u32,
+    internal_page_count: u32,
+    total_uncompressed_pages_in_compressor: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct XswUsage {
+    total: u64,
+    avail: u64,
+    used: u64,
+    pagesize: u32,
+    encrypted: u32,
+}
+
+const HOST_VM_INFO64: c_int = 4;
+const MIB: f64 = 1_048_576.0;
+
+extern "C" {
+    fn mach_host_self() -> u32;
+    fn host_statistics64(host: u32, flavor: c_int, info: *mut i32, count: *mut u32) -> c_int;
+    fn mach_port_deallocate(task: u32, name: u32) -> c_int;
+    static mach_task_self_: u32;
+    fn sysctlbyname(
+        name: *const c_char,
+        oldp: *mut c_void,
+        oldlenp: *mut usize,
+        newp: *mut c_void,
+        newlen: usize,
+    ) -> c_int;
+}
+
+fn vm_statistics() -> Option<VmStatistics64> {
+    let host = unsafe { mach_host_self() };
+    if host == 0 {
+        return None;
     }
-    None
+    let mut stats = VmStatistics64::default();
+    let mut count = (std::mem::size_of::<VmStatistics64>() / std::mem::size_of::<i32>()) as u32;
+    let kr = unsafe {
+        host_statistics64(
+            host,
+            HOST_VM_INFO64,
+            &mut stats as *mut VmStatistics64 as *mut i32,
+            &mut count,
+        )
+    };
+    unsafe {
+        mach_port_deallocate(mach_task_self_, host);
+    }
+    if kr == 0 {
+        Some(stats)
+    } else {
+        None
+    }
 }
 
-fn mib(value: &str, key: &str) -> Option<f64> {
-    let rest = value.split(key).nth(1)?;
-    let num: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    num.parse::<f64>().ok()
+fn sysctl_named<T: Default>(name: &str) -> Option<T> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut out = T::default();
+    let mut len = std::mem::size_of::<T>();
+    let rc = unsafe {
+        sysctlbyname(
+            cname.as_ptr(),
+            &mut out as *mut T as *mut c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && len == std::mem::size_of::<T>() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
-/// Real numbers from `vm_stat` and `vm.swapusage`, including how much cache is
-/// actually available to reclaim. A purge is only justified when that number is
-/// large — otherwise it frees nothing and just stalls the disk.
 pub fn memory_stats() -> Option<MemStats> {
-    let page_size = run(SYSCTL, &["-n", "hw.pagesize"])
-        .and_then(|s| s.trim().parse::<f64>().ok())
+    let vm = vm_statistics()?;
+    let page_size = sysctl_named::<u32>("hw.pagesize")
+        .map(|v| v as f64)
         .filter(|v| *v > 0.0)
         .unwrap_or(4096.0);
-    let total_bytes = run(SYSCTL, &["-n", "hw.memsize"])
-        .and_then(|s| s.trim().parse::<f64>().ok())?;
-    let total_mb = total_bytes / 1_048_576.0;
-
-    let text = run(VM_STAT, &[])?;
-    let to_mb = |p: f64| p * page_size / 1_048_576.0;
-    let free_mb = to_mb(pages(&text, "Pages free").unwrap_or(0.0));
-    let compressed_mb = to_mb(pages(&text, "Pages occupied by compressor").unwrap_or(0.0));
-    let reclaimable_mb = to_mb(
-        pages(&text, "Pages purgeable").unwrap_or(0.0)
-            + pages(&text, "File-backed pages").unwrap_or(0.0),
-    );
-
-    let swap = run(SYSCTL, &["-n", "vm.swapusage"]).unwrap_or_default();
-    let swap_total = mib(&swap, "total = ").unwrap_or(0.0);
-    let swap_used = mib(&swap, "used = ").unwrap_or(0.0);
-    let swap_used_pct = if swap_total > 0.0 {
-        (swap_used / swap_total * 100.0).clamp(0.0, 100.0)
+    let total_mb = sysctl_named::<u64>("hw.memsize")? as f64 / MIB;
+    let to_mb = |pages: u32| pages as f64 * page_size / MIB;
+    let swap = sysctl_named::<XswUsage>("vm.swapusage").unwrap_or_default();
+    let swap_total_mb = swap.total as f64 / MIB;
+    let swap_used_mb = swap.used as f64 / MIB;
+    let swap_used_pct = if swap_total_mb > 0.0 {
+        (swap_used_mb / swap_total_mb * 100.0).clamp(0.0, 100.0)
     } else {
         0.0
     };
-
     Some(MemStats {
         total_mb,
-        free_mb,
-        compressed_mb,
-        reclaimable_mb,
+        free_mb: to_mb(vm.free_count + vm.speculative_count),
+        compressed_mb: to_mb(vm.compressor_page_count),
+        reclaimable_mb: to_mb(vm.purgeable_count + vm.external_page_count),
+        swap_used_mb,
+        swap_total_mb,
         swap_used_pct,
-        kernel_pressure: run(SYSCTL, &["-n", "kern.memorystatus_vm_pressure_level"])
-            .and_then(|s| s.trim().parse::<u8>().ok()),
+        kernel_pressure: sysctl_named::<u32>("kern.memorystatus_vm_pressure_level")
+            .map(|v| v as u8),
     })
 }
 
@@ -292,4 +368,32 @@ pub fn restart_coreaudio() -> Result<String, String> {
         Some(pid) => format!("Core Audio engine restarted by launchd (pid {}).", pid),
         None => "Core Audio signalled; launchd is relaunching it.".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mach_sampler_is_plausible_and_cheap() {
+        let m = memory_stats().expect("memory stats must be readable on macOS");
+        assert!(m.total_mb > 0.0, "total memory unknown");
+        assert!(m.free_mb >= 0.0 && m.free_mb <= m.total_mb);
+        assert!(m.compressed_mb >= 0.0 && m.compressed_mb <= m.total_mb);
+        assert!(m.reclaimable_mb >= 0.0 && m.reclaimable_mb <= m.total_mb);
+        assert!((0.0..=100.0).contains(&m.swap_used_pct));
+        assert!(m.kernel_pressure.is_some(), "kernel pressure must be readable");
+
+        // The whole point of the Mach path: no child processes. 200 samples
+        // spawning `vm_stat` would take hundreds of milliseconds.
+        let t = std::time::Instant::now();
+        for _ in 0..200 {
+            let _ = memory_stats();
+        }
+        assert!(
+            t.elapsed().as_micros() < 200_000,
+            "200 samples took {:?}, which means a fork slipped in",
+            t.elapsed()
+        );
+    }
 }

@@ -76,6 +76,63 @@ pub fn pressure_level(
     }
 }
 
+/// How long the trend window looks back.
+pub const TREND_WINDOW_S: f64 = 20.0;
+
+/// What the daemon asks for at this pressure. Cache first — dropping cache has
+/// no user-visible cost — and app trimming only when there is nothing to drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Advice {
+    Hold,
+    ReclaimCache,
+    TrimApps,
+}
+
+impl Advice {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Advice::Hold => "hold",
+            Advice::ReclaimCache => "reclaim",
+            Advice::TrimApps => "trim",
+        }
+    }
+}
+
+pub fn advice(pressure: Pressure, reclaimable_mb: f64, swap_used_pct: f64) -> Advice {
+    match pressure {
+        Pressure::Normal => Advice::Hold,
+        _ if reclaimable_mb >= MIN_RECLAIM_MB && swap_used_pct < SWAP_THRASH_PCT => {
+            Advice::ReclaimCache
+        }
+        _ => Advice::TrimApps,
+    }
+}
+
+/// Growth of the compressor and of swap across a window, in MB/s. Predictive,
+/// not reactive: a machine climbing into pressure is visible before it is
+/// critical, so cache can be dropped while it still helps.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Trend {
+    pub compressed_mb_per_s: f64,
+    pub swap_mb_per_s: f64,
+}
+
+/// `samples` is `(elapsed_seconds, compressed_mb, swap_used_mb)`, oldest first.
+pub fn trend(samples: &[(f64, f64, f64)], window_s: f64) -> Trend {
+    let (first, last) = match (samples.first(), samples.last()) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return Trend::default(),
+    };
+    let dt = (last.0 - first.0).min(window_s);
+    if dt <= 0.0 {
+        return Trend::default();
+    }
+    Trend {
+        compressed_mb_per_s: ((last.1 - first.1) / dt).max(0.0),
+        swap_mb_per_s: ((last.2 - first.2) / dt).max(0.0),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     None,
@@ -182,6 +239,35 @@ mod tests {
         let mut i = inputs();
         i.swap_used_pct = SWAP_THRASH_PCT;
         assert_eq!(plan(&i), Action::None);
+    }
+
+    #[test]
+    fn advice_reclaims_before_asking_anyone_to_quit() {
+        assert_eq!(advice(Pressure::Normal, 4096.0, 0.0), Advice::Hold);
+        assert_eq!(
+            advice(Pressure::High, 4096.0, 10.0),
+            Advice::ReclaimCache
+        );
+        // Nothing reclaimable, or swap is already thrashing: apps are the lever.
+        assert_eq!(advice(Pressure::High, 512.0, 10.0), Advice::TrimApps);
+        assert_eq!(
+            advice(Pressure::Critical, 4096.0, SWAP_THRASH_PCT),
+            Advice::TrimApps
+        );
+    }
+
+    #[test]
+    fn trend_is_positive_growth_only() {
+        let rising = trend(&[(0.0, 100.0, 50.0), (10.0, 300.0, 150.0)], 20.0);
+        assert!((rising.compressed_mb_per_s - 20.0).abs() < 1e-9);
+        assert!((rising.swap_mb_per_s - 10.0).abs() < 1e-9);
+
+        let falling = trend(&[(0.0, 300.0, 150.0), (10.0, 100.0, 50.0)], 20.0);
+        assert_eq!(falling, Trend::default());
+
+        // One sample, or a zero window, is not a trend.
+        assert_eq!(trend(&[(0.0, 100.0, 50.0)], 20.0), Trend::default());
+        assert_eq!(trend(&[(0.0, 1.0, 1.0), (5.0, 9.0, 9.0)], 0.0), Trend::default());
     }
 
     #[test]

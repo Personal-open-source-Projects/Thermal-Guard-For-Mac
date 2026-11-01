@@ -72,6 +72,9 @@ regression test.
   2 warning, 4 critical), the kernel's own verdict; free-page thresholds are
   only a fallback when it is unreadable. macOS keeps free pages low on purpose,
   so a free-percentage-only rule would purge a healthy machine.
+- Sampling is read-only FFI (`host_statistics64` and `sysctlbyname`), with no
+  child processes, no writes to kernel state and no caller input; the Mach host
+  port is deallocated on every call so the daemon cannot leak send rights.
 - `purge` runs only under high/critical kernel pressure, with at least 1 GB of
   measured reclaimable (purgeable + file-backed) cache, and swap use below 70 %.
   It is rate-limited to once per 30 minutes and twice per hour, takes **no
