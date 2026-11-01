@@ -5,6 +5,7 @@
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 const PMSET: &str = "/usr/bin/pmset";
 const SYSCTL: &str = "/usr/sbin/sysctl";
@@ -60,6 +61,37 @@ pub fn set_low_power_mode(on: bool) -> Result<(), String> {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Cached low power mode state. The pmset custom output changes infrequently,
+/// so caching avoids a process spawn on every state check.
+pub struct LowPowerCache {
+    state: Option<bool>,
+    until: Instant,
+}
+
+impl LowPowerCache {
+    pub fn new() -> Self {
+        Self { state: None, until: Instant::now() }
+    }
+
+    /// Returns the cached state if fresh, otherwise reads from pmset and caches.
+    pub fn get(&mut self, sock: &str) -> Option<bool> {
+        if let Some(state) = self.state.clone() {
+            if Instant::now() < self.until {
+                return Some(state);
+            }
+        }
+        self.state = low_power_mode();
+        self.until = Instant::now() + Duration::from_secs(6);
+        self.state.as_ref().copied()
+    }
+
+    /// Invalidate the cache after a state change.
+    pub fn invalidate(&mut self) {
+        self.state = None;
+        self.until = Instant::now();
     }
 }
 
@@ -130,6 +162,16 @@ pub fn battery_temp() -> Option<f64> {
         }
     }
     None
+}
+
+/// Check if the battery is running hot. Battery/VRM heat stacks on SoC heat
+/// when charging, making the chassis harder to cool.
+/// Returns true when the battery temperature is elevated enough to warrant
+/// earlier power capping.
+pub fn battery_is_hot(temp_c: Option<f64>) -> bool {
+    // Battery above 45°C is considered hot; at this point the VRM and battery
+    // chemistry add meaningful heat to the chassis.
+    temp_c.map_or(false, |t| t >= 45.0)
 }
 
 pub fn on_ac_power() -> bool {

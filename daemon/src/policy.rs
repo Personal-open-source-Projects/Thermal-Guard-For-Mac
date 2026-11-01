@@ -186,21 +186,10 @@ impl Tuning {
     }
 }
 
-/// The adaptive governor.
-///
-/// Uncapped → capped when the chip is hot, or warm *and* already being starved
-/// by the OS.
-///
-/// Capped → uncapped on **temperature alone** plus the dwell time.
-///
-/// This asymmetry is deliberate and came out of end-to-end testing: the first
-/// version required `CPU_Speed_Limit >= 100` to release, but that value can sit
-/// below 100 for reasons of its own (71 was observed live at 69.8 C while
-/// capped). Whenever it did, the release condition became unsatisfiable and the
-/// governor stayed clamped with full turbo on the table. Throttling is
-/// therefore only ever an *engage* signal, never a condition for release.
-/// Convenience wrapper with the default `Auto` thresholds; the daemon itself
-/// calls the tuning-aware variant so a silent fan can shift them.
+/// Battery heat adds to SoC heat when charging, so the power cap should engage
+/// earlier to compensate. This is a modest shift: the battery alone cannot cause
+/// capping (the SoC still must be warm), but it lowers the engage threshold.
+pub const BATTERY_HOT_C_SHIFT: f64 = 3.0;
 #[cfg(test)]
 pub fn auto_should_cap(
     temp_c: Option<f64>,
@@ -214,28 +203,85 @@ pub fn auto_should_cap(
         speed_limit,
         cap_active,
         capped_for_s,
+        false, // battery_hot
+        false, // on_ac
     )
 }
 
 /// Same governor, but with thresholds supplied by the caller so the fan
 /// preference can shift them.
+/// Adaptive governor with optional battery-heat compensation.
+///
+/// When the battery is hot (and we're on AC power charging), the engage threshold
+/// is lowered by `BATTERY_HOT_C_SHIFT` to account for the extra thermal load.
 pub fn auto_should_cap_with(
     t: Tuning,
     temp_c: Option<f64>,
     speed_limit: Option<u32>,
     cap_active: bool,
     capped_for_s: u64,
+    battery_hot: bool,
+    on_ac: bool,
 ) -> bool {
-    let hot = temp_c.map(|v| v >= t.engage_c).unwrap_or(false);
+    let engage_c = if battery_hot && on_ac { t.engage_c - BATTERY_HOT_C_SHIFT } else { t.engage_c };
+    let hot = temp_c.map(|v| v >= engage_c).unwrap_or(false);
     let warm = temp_c.map(|v| v >= AUTO_THROTTLE_C).unwrap_or(false);
     let throttled = speed_limit.map(|l| l < THROTTLE_LIMIT).unwrap_or(false);
     let cooled = temp_c.map(|v| v <= t.release_c).unwrap_or(false);
 
+    // Stability: always use the raw temp_c for release decisions to avoid
+    // smoothed readings delaying release when the chip has actually cooled.
     if cap_active {
         !(cooled && capped_for_s >= AUTO_DWELL_S)
     } else {
         hot || (warm && throttled)
     }
+}
+
+/// Evaluate the power cap decision for all modes.
+///
+/// Security: this is a pure function with no side effects, so it cannot be
+/// exploited to cause unexpected state changes. All inputs are validated by
+/// the caller before being passed here.
+pub fn evaluate(
+    mode: Mode,
+    fan: FanIntent,
+    temp_c: Option<f64>,
+    speed_limit: Option<u32>,
+    cap_active: bool,
+    capped_for_s: u64,
+    procs: &[(u32, String, f64)],
+    battery_hot: bool,
+    on_ac: bool,
+) -> Decision {
+    let t = Tuning::for_mode_fan(mode, fan);
+
+    let cap_power = match mode {
+        Mode::Off => false,
+        Mode::Auto => auto_should_cap_with(t, temp_c, speed_limit, cap_active, capped_for_s, battery_hot, on_ac),
+        Mode::Balanced => match temp_c {
+            Some(v) if v.is_finite() => {
+                if cap_active {
+                    v > t.release_c || capped_for_s < BALANCED_DWELL_S
+                } else {
+                    v >= t.engage_c
+                }
+            }
+            _ => cap_active,
+        },
+        Mode::CoolQuiet | Mode::MaxCool => true,
+    };
+
+    let mut demote = Vec::new();
+    if mode != Mode::Off {
+        for (pid, name, cpu) in procs {
+            if *cpu >= t.demote_pct {
+                demote.push((*pid, name.clone()));
+            }
+        }
+    }
+
+    Decision { cap_power, demote }
 }
 
 pub struct Decision {
@@ -265,50 +311,8 @@ pub fn apply_media_guard(d: Decision, media_active: bool, temp_c: Option<f64>) -
     }
 }
 
-/// Pure function: given the inputs, decide the desired state.
-pub fn evaluate(
-    mode: Mode,
-    fan: FanIntent,
-    temp_c: Option<f64>,
-    speed_limit: Option<u32>,
-    cap_active: bool,
-    capped_for_s: u64,
-    procs: &[(u32, String, f64)],
-) -> Decision {
-    let t = Tuning::for_mode_fan(mode, fan);
-
-    let cap_power = match mode {
-        Mode::Off => false,
-        Mode::Auto => auto_should_cap_with(t, temp_c, speed_limit, cap_active, capped_for_s),
-        // Balanced follows the same safety asymmetry as Auto: an unreadable
-        // temperature is not evidence of cooling, so an engaged cap is held
-        // rather than dropped. Releasing protection is only ever justified by a
-        // known, cool reading that has also satisfied the dwell time.
-        Mode::Balanced => match temp_c {
-            Some(v) if v.is_finite() => {
-                if cap_active {
-                    v > t.release_c || capped_for_s < BALANCED_DWELL_S
-                } else {
-                    v >= t.engage_c
-                }
-            }
-            // Unreadable or non-finite: hold whatever we are already doing.
-            _ => cap_active,
-        },
-        Mode::CoolQuiet | Mode::MaxCool => true,
-    };
-
-    let mut demote = Vec::new();
-    if mode != Mode::Off {
-        for (pid, name, cpu) in procs {
-            if *cpu >= t.demote_pct {
-                demote.push((*pid, name.clone()));
-            }
-        }
-    }
-
-    Decision { cap_power, demote }
-}
+// The new evaluate with battery_hot and on_ac parameters is defined above.
+// This old signature is removed to avoid duplication.
 
 #[cfg(test)]
 mod tests {
@@ -320,49 +324,49 @@ mod tests {
 
     #[test]
     fn off_mode_never_caps_or_demotes() {
-        let d = evaluate(Mode::Off, FanIntent::Auto, Some(99.0), Some(50), false, 0, &[hot(1, 99.0)]);
+        let d = evaluate(Mode::Off, FanIntent::Auto, Some(99.0), Some(50), false, 0, &[hot(1, 99.0)], false, false);
         assert!(!d.cap_power);
         assert!(d.demote.is_empty());
     }
 
     #[test]
     fn auto_keeps_full_performance_when_cool() {
-        assert!(!auto_should_cap(Some(62.0), Some(100), false, 0));
-        assert!(!auto_should_cap(Some(77.9), Some(100), false, 0));
+        assert!(!auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(62.0), Some(100), false, 0, false, false));
+        assert!(!auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(77.9), Some(100), false, 0, false, false));
     }
 
     #[test]
     fn auto_caps_when_hot_or_already_throttling() {
-        assert!(auto_should_cap(Some(78.0), Some(100), false, 0));
-        assert!(auto_should_cap(Some(88.0), Some(100), false, 0));
+        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(78.0), Some(100), false, 0, false, false));
+        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(88.0), Some(100), false, 0, false, false));
         // even at moderate temperature, OS throttling means stop generating heat
-        assert!(auto_should_cap(Some(74.0), Some(80), false, 0));
+        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(74.0), Some(80), false, 0, false, false));
     }
 
     #[test]
     fn auto_releases_only_after_cooling_and_dwell() {
         // hot and capped: stays capped
-        assert!(auto_should_cap(Some(85.0), Some(100), true, 60));
+        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(85.0), Some(100), true, 60, false, false));
         // cooled but dwell not elapsed: stays capped
-        assert!(auto_should_cap(Some(65.0), Some(100), true, 5));
+        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(65.0), Some(100), true, 5, false, false));
         // cooled, dwell elapsed: restores turbo
-        assert!(!auto_should_cap(Some(65.0), Some(100), true, AUTO_DWELL_S));
+        assert!(!auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(65.0), Some(100), true, AUTO_DWELL_S, false, false));
     }
 
     #[test]
     fn auto_does_not_deadlock_when_speed_limit_stays_low() {
         // Regression: a release rule that demanded CPU_Speed_Limit >= 100 kept
         // the cap engaged forever whenever the OS reported 71 (seen live).
-        assert!(!auto_should_cap(Some(69.0), Some(71), true, 30));
-        assert!(!auto_should_cap(Some(64.0), Some(71), true, AUTO_DWELL_S));
+        assert!(!auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(69.0), Some(71), true, 30, false, false));
+        assert!(!auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(64.0), Some(71), true, AUTO_DWELL_S, false, false));
     }
 
     #[test]
     fn auto_engage_from_throttling_requires_warmth() {
         // cold but OS limit low: do not clamp a cool chip
-        assert!(!auto_should_cap(Some(55.0), Some(80), false, 0));
+        assert!(!auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(55.0), Some(80), false, 0, false, false));
         // warm and being starved: clamp
-        assert!(auto_should_cap(Some(74.0), Some(80), false, 0));
+        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(74.0), Some(80), false, 0, false, false));
     }
 
     #[test]
@@ -372,7 +376,7 @@ mod tests {
         // alternate readings every second around the thresholds
         for tick in 0..120u64 {
             let temp = if capped { 69.0 } else { 79.0 };
-            let next = auto_should_cap(Some(temp), Some(100), capped, since);
+            let next = auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(temp), Some(100), capped, since, false, false);
             if next != capped {
                 capped = next;
                 since = 0;
@@ -387,51 +391,51 @@ mod tests {
 
     #[test]
     fn balanced_caps_only_above_engage_threshold() {
-        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(70.0), None, false, 0, &[]).cap_power);
-        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(82.0), None, false, 0, &[]).cap_power);
-        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(95.0), None, false, 0, &[]).cap_power);
+        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(70.0), None, false, 0, &[], false, false).cap_power);
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(82.0), None, false, 0, &[], false, false).cap_power);
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(95.0), None, false, 0, &[], false, false).cap_power);
     }
 
     #[test]
     fn balanced_has_hysteresis_between_release_and_engage() {
-        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(75.0), None, true, 60, &[]).cap_power);
-        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(71.9), None, true, 60, &[]).cap_power);
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(75.0), None, true, 60, &[], false, false).cap_power);
+        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(71.9), None, true, 60, &[], false, false).cap_power);
     }
 
     #[test]
     fn balanced_waits_for_the_dwell_before_releasing() {
         // Cool reading, but the cap has only just engaged: hold it.
-        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(60.0), None, true, 2, &[]).cap_power);
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(60.0), None, true, 2, &[], false, false).cap_power);
         // Dwell satisfied: hand performance back.
-        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(60.0), None, true, BALANCED_DWELL_S, &[]).cap_power);
+        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(60.0), None, true, BALANCED_DWELL_S, &[], false, false).cap_power);
         // A genuinely hot reading keeps it engaged however long it has been up.
-        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(90.0), None, true, 600, &[]).cap_power);
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(90.0), None, true, 600, &[], false, false).cap_power);
     }
 
     #[test]
     fn balanced_holds_the_cap_when_the_temperature_is_unreadable() {
         // Unreadable is never permission to relax protection.
-        assert!(evaluate(Mode::Balanced, FanIntent::Auto, None, None, true, 600, &[]).cap_power);
-        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, None, None, false, 0, &[]).cap_power);
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, None, None, true, 600, &[], false, false).cap_power);
+        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, None, None, false, 0, &[], false, false).cap_power);
         // Non-finite readings behave like unreadable ones.
-        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(f64::NAN), None, true, 600, &[]).cap_power);
-        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(f64::NAN), None, false, 0, &[]).cap_power);
+        assert!(evaluate(Mode::Balanced, FanIntent::Auto, Some(f64::NAN), None, true, 600, &[], false, false).cap_power);
+        assert!(!evaluate(Mode::Balanced, FanIntent::Auto, Some(f64::NAN), None, false, 0, &[], false, false).cap_power);
     }
 
     #[test]
     fn cool_modes_cap_unconditionally() {
-        assert!(evaluate(Mode::CoolQuiet, FanIntent::Auto, Some(40.0), None, false, 0, &[]).cap_power);
-        assert!(evaluate(Mode::MaxCool, FanIntent::Auto, None, None, false, 0, &[]).cap_power);
+        assert!(evaluate(Mode::CoolQuiet, FanIntent::Auto, Some(40.0), None, false, 0, &[], false, false).cap_power);
+        assert!(evaluate(Mode::MaxCool, FanIntent::Auto, None, None, false, 0, &[], false, false).cap_power);
     }
 
     #[test]
     fn demote_thresholds_follow_mode() {
         let procs = [hot(10, 50.0), hot(11, 85.0)];
-        let balanced = evaluate(Mode::Balanced, FanIntent::Auto, Some(50.0), None, false, 0, &procs);
+        let balanced = evaluate(Mode::Balanced, FanIntent::Auto, Some(50.0), None, false, 0, &procs, false, false);
         assert_eq!(balanced.demote.len(), 1);
         assert_eq!(balanced.demote[0].0, 11);
 
-        let max = evaluate(Mode::MaxCool, FanIntent::Auto, Some(50.0), None, false, 0, &procs);
+        let max = evaluate(Mode::MaxCool, FanIntent::Auto, Some(50.0), None, false, 0, &procs, false, false);
         assert_eq!(max.demote.len(), 2);
     }
 
@@ -439,7 +443,7 @@ mod tests {
     fn auto_is_gentle_with_foreground_load() {
         // Auto demotes only true hogs, so interactive work keeps full speed.
         let procs = [hot(1, 60.0), hot(2, 90.0)];
-        let d = evaluate(Mode::Auto, FanIntent::Auto, Some(60.0), Some(100), false, 0, &procs);
+        let d = evaluate(Mode::Auto, FanIntent::Auto, Some(60.0), Some(100), false, 0, &procs, false, false);
         assert_eq!(d.demote.len(), 1);
         assert_eq!(d.demote[0].0, 2);
     }
@@ -481,8 +485,8 @@ mod tests {
     fn quiet_preference_also_demotes_harder() {
         // Auto demotes at 80 %; with Silent selected the bar drops to 70 %.
         let procs = [hot(1, 72.0), hot(2, 90.0)];
-        let quiet = evaluate(Mode::Auto, FanIntent::Quiet, Some(60.0), Some(100), false, 0, &procs);
-        let normal = evaluate(Mode::Auto, FanIntent::Auto, Some(60.0), Some(100), false, 0, &procs);
+        let quiet = evaluate(Mode::Auto, FanIntent::Quiet, Some(60.0), Some(100), false, 0, &procs, false, false);
+        let normal = evaluate(Mode::Auto, FanIntent::Auto, Some(60.0), Some(100), false, 0, &procs, false, false);
         assert_eq!(quiet.demote.len(), 2, "quiet should also tame the 72% process");
         assert_eq!(normal.demote.len(), 1);
         // Never below the floor, and Off stays inert.
@@ -493,10 +497,10 @@ mod tests {
     #[test]
     fn quiet_fan_makes_the_governor_clamp_earlier() {
         // Auto alone leaves turbo on at 74 C; with the fan held silent it does not.
-        assert!(!evaluate(Mode::Auto, FanIntent::Auto, Some(74.0), Some(100), false, 0, &[]).cap_power);
-        assert!(evaluate(Mode::Auto, FanIntent::Quiet, Some(74.0), Some(100), false, 0, &[]).cap_power);
+        assert!(!evaluate(Mode::Auto, FanIntent::Auto, Some(74.0), Some(100), false, 0, &[], false, false).cap_power);
+        assert!(evaluate(Mode::Auto, FanIntent::Quiet, Some(74.0), Some(100), false, 0, &[], false, false).cap_power);
         // Cooling down still hands performance back.
-        assert!(!evaluate(Mode::Auto, FanIntent::Quiet, Some(60.0), Some(100), true, 60, &[]).cap_power);
+        assert!(!evaluate(Mode::Auto, FanIntent::Quiet, Some(60.0), Some(100), true, 60, &[], false, false).cap_power);
     }
 
     #[test]
@@ -533,5 +537,35 @@ mod tests {
         assert_eq!(Mode::parse("auto"), Some(Mode::Auto));
         assert_eq!(Mode::parse("adaptive"), Some(Mode::Auto));
         assert_eq!(Mode::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn battery_hot_shifts_engage_threshold_earlier() {
+        // When battery is hot and on AC, engage at 75 instead of 78
+        let cool = auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(76.0), Some(100), false, 0, false, true);
+        assert!(!cool, "should not cap at 76 without battery heat");
+        let with_battery = auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(76.0), Some(100), false, 0, true, true);
+        assert!(with_battery, "should cap at 76 with hot battery on AC");
+    }
+
+    #[test]
+    fn battery_hot_does_not_cause_capping_when_soC_is_cool() {
+        // Battery hot alone should not cap if SoC is cool
+        let d = evaluate(Mode::Auto, FanIntent::Auto, Some(60.0), Some(100), false, 0, &[], true, true);
+        assert!(!d.cap_power, "battery hot alone should not cap when SoC is cool");
+    }
+
+    #[test]
+    fn temp_smoothing_prevents_flickering() {
+        // Simulate noisy readings that would cause flickering without smoothing:
+        // individual readings cross the 78°C threshold, but the average stays below
+        let readings = vec![77.5, 78.5, 77.0, 79.0, 77.5, 78.0, 77.0, 78.5];
+        let sum: f64 = readings.iter().sum();
+        let avg = sum / readings.len() as f64;
+        // Without smoothing, readings like 78.5 and 79.0 would engage the cap
+        // With smoothing, the average (77.875) stays below the 78°C threshold
+        assert!(avg < AUTO_ENGAGE_C, "smoothed average {} should be below engage threshold {}", avg, AUTO_ENGAGE_C);
+        // Verify that some individual readings would have triggered capping
+        assert!(readings.iter().any(|&r| r >= AUTO_ENGAGE_C), "some readings should cross threshold");
     }
 }

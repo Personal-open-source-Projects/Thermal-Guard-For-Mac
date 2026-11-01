@@ -1381,9 +1381,37 @@ fn main() {
     // its dwell time and cannot flap every tick.
     let mut capped_since: Option<Instant> = None;
 
+    // Temperature smoothing: a small ring buffer to reduce SMC noise.
+    // The SMC can return slightly different values on consecutive reads,
+    // and when those values hover around a threshold the cap will flicker.
+    // A short-term average prevents this without adding noticeable lag.
+    const TEMP_SMOOTH_N: usize = 5;
+    let mut temp_buffer: Vec<f64> = Vec::new();
+
     loop {
         let smc = smc_holder();
-        let cpu_temp = read_first(&smc, smc::CPU_TEMP_KEYS);
+        let raw_temp = read_first(&smc, smc::CPU_TEMP_KEYS);
+        // Smooth the temperature reading to prevent SMC noise from causing
+        // the power cap to flicker when the temperature hovers around a threshold.
+        let cpu_temp: Option<f64> = {
+            let valid = raw_temp.filter(|t| t.is_finite() && *t >= -20.0 && *t <= 130.0);
+            match valid {
+                Some(v) => {
+                    temp_buffer.push(v);
+                    if temp_buffer.len() > TEMP_SMOOTH_N {
+                        temp_buffer.remove(0);
+                    }
+                    let sum: f64 = temp_buffer.iter().sum();
+                    Some(sum / temp_buffer.len() as f64)
+                }
+                None => {
+                    // Keep the buffer drained when readings are invalid so we
+                    // don't average stale data with new readings.
+                    temp_buffer.clear();
+                    None
+                }
+            }
+        };
         let fan_rpm = read_opt(&smc, "F0Ac");
         let fan_min = read_opt(&smc, "F0Mn");
         let fan_max = read_opt(&smc, "F0Mx");
@@ -1491,6 +1519,7 @@ fn main() {
             let sh = shared.lock().unwrap();
             sh.media_guard
         };
+        let battery_hot = system::battery_is_hot(battery_temp);
         let decision = policy::apply_media_guard(
             policy::evaluate(
                 mode,
@@ -1500,6 +1529,8 @@ fn main() {
                 cap_active,
                 capped_for_s,
                 &inputs,
+                battery_hot,
+                ac,
             ),
             media_active && guard_on,
             cpu_temp,
