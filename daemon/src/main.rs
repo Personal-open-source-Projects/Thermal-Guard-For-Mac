@@ -107,7 +107,7 @@ struct Shared {
     /// User setting: reset a stuck Core Audio engine (automatic, default on).
     audio_guard: bool,
     /// Human-readable watchdog state: watching / spike / restarted / off.
-    audio_state: String,
+
     audio_note: String,
     /// Reset bookkeeping: total, last time, and the rolling-hour window.
     audio_restarts: u32,
@@ -158,6 +158,9 @@ struct Shared {
     soft_ratio: Option<u32>,
     lpm_ratio: Option<u32>,
     started: Instant,
+    /// A user-visible setting or the tracked set changed: persist now, not on
+    /// the next 10 s housekeeping write.
+    dirty: bool,
 }
 
 impl Default for Shared {
@@ -182,7 +185,6 @@ impl Default for Shared {
             media_active: false,
             media_guard: true,
             audio_guard: true,
-            audio_state: "watching".into(),
             audio_note: String::new(),
             audio_restarts: 0,
             audio_last: None,
@@ -223,6 +225,7 @@ impl Default for Shared {
             soft_ratio: None,
             lpm_ratio: None,
             started: Instant::now(),
+            dirty: true,
         }
     }
 }
@@ -310,6 +313,26 @@ fn write_state(sh: &Shared) {
     let _ = std::fs::rename(&tmp, &path);
 }
 
+/// Audio watchdog state derived from the *current* settings, so a mode change
+/// is visible in the very next status reply instead of on the next tick.
+fn audio_state_for(sh: &Shared) -> &'static str {
+    if !sh.audio_guard {
+        "off"
+    } else if sh.mode == Mode::Off {
+        "off (mode)"
+    } else if sh.audio_streak >= audio::SPIKE_SAMPLES {
+        "spike"
+    } else if sh
+        .audio_last
+        .map(|t| t.elapsed().as_secs() < 10)
+        .unwrap_or(false)
+    {
+        "restarted"
+    } else {
+        "watching"
+    }
+}
+
 fn state_json(sh: &Shared) -> String {
     let procs_json: Vec<String> = sh
         .procs
@@ -359,7 +382,7 @@ fn state_json(sh: &Shared) -> String {
         json::b("media_active", sh.media_active),
         json::b("media_guard", sh.media_guard),
         json::b("audio_guard", sh.audio_guard),
-        json::s("audio_state", &sh.audio_state),
+        json::s("audio_state", audio_state_for(sh)),
         json::s("audio_note", &sh.audio_note),
         json::i("audio_restarts", sh.audio_restarts as i64),
         format!("\"coreaudiod_cpu\":{}", opt_num(sh.coreaudiod_cpu)),
@@ -749,6 +772,7 @@ fn reconcile_auto_trim(sh: &mut Shared) {
                 }
                 sh.auto_trimmed.sort();
                 sh.auto_trimmed.dedup();
+                sh.dirty = true;
                 // Disabling stops future launches; also stop the copy that is
                 // running now, gracefully, so the saving starts immediately.
                 let stopped = apple::stop_running(&id);
@@ -775,6 +799,7 @@ fn reconcile_auto_trim(sh: &mut Shared) {
         trim::Action::Enable(id) => match apple::set(&id, true) {
             Ok(_) => {
                 sh.auto_trimmed.retain(|x| x != &id);
+                sh.dirty = true;
                 sh.auto_trim_note = format!("Restored {}.", id);
                 push_event(sh, &format!("auto-trim: restored {}", id));
             }
@@ -786,6 +811,7 @@ fn reconcile_auto_trim(sh: &mut Shared) {
         },
         trim::Action::Forget(id) => {
             sh.auto_trimmed.retain(|x| x != &id);
+            sh.dirty = true;
             sh.auto_trim_note = format!("{} is enabled again; no longer tracked.", id);
         }
     }
@@ -953,7 +979,6 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                     sh.audio_restarts_window.push(Instant::now());
                     sh.audio_streak = 0;
                     sh.audio_note = note;
-                    sh.audio_state = "restarted".into();
                     push_event(&mut sh, "core audio reset (test hook)");
                     state_json(&sh)
                 }
@@ -978,6 +1003,7 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                 let mut sh = shared.lock().unwrap();
                 if sh.auto_trim != on {
                     sh.auto_trim = on;
+                    sh.dirty = true;
                     if on && sh.mode != Mode::Off {
                         let grace = trim_grace_s();
                         sh.trim_grace_until =
@@ -1025,6 +1051,7 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                     let mut sh = shared.lock().unwrap();
                     if sh.media_guard != on {
                         sh.media_guard = on;
+                        sh.dirty = true;
                         push_event(
                             &mut sh,
                             if on {
@@ -1044,8 +1071,8 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                 if sh.audio_guard != on {
                     sh.audio_guard = on;
                     sh.audio_streak = 0;
+                    sh.dirty = true;
                     if !on {
-                        sh.audio_state = "off".into();
                         sh.audio_note = "Core Audio watchdog off; nothing is signalled.".into();
                     }
                     push_event(
@@ -1064,6 +1091,7 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                 let mut sh = shared.lock().unwrap();
                 if sh.memory_reclaim != on {
                     sh.memory_reclaim = on;
+                    sh.dirty = true;
                     sh.memory_note = if on {
                         "Cache reclaim on; it runs only under real pressure.".into()
                     } else {
@@ -1091,6 +1119,7 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                 push_event(&mut sh, &format!("mode -> {}", m.label()));
             }
             sh.mode = m;
+            sh.dirty = true;
             // Any cooling mode keeps the trimmer working; Off hands every
             // tracked service back. Leaving Off starts the grace clock, so a
             // mode change never disables a service the same instant.
@@ -1114,6 +1143,7 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
         }
         if let Some(f) = apply_fan {
             sh.fan_intent = f;
+            sh.dirty = true;
             // A fresh choice gets a fresh attempt: an earlier refused write
             // must not delay the SMC being asked again (or the fan being
             // handed back when the user returns to the SMC curve).
@@ -1146,6 +1176,14 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
         }
     }
 
+    {
+        let mut sh = shared.lock().unwrap();
+        if sh.dirty {
+            write_state(&sh);
+            sh.dirty = false;
+        }
+    }
+
     let body = {
         let sh = shared.lock().unwrap();
         state_json(&sh)
@@ -1163,7 +1201,7 @@ fn smc_holder() -> Option<smc::Smc> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        println!("thermalguardd 1.8.0");
+        println!("thermalguardd 1.8.1");
         return;
     }
     if args.iter().any(|a| a == "--memory-probe") {
@@ -1543,7 +1581,6 @@ fn main() {
                     sh.audio_restarts_window.push(Instant::now());
                     sh.audio_streak = 0;
                     sh.audio_note = note;
-                    sh.audio_state = "restarted".into();
                     push_event(
                         &mut sh,
                         "core audio engine reset after a sustained spike",
@@ -1552,7 +1589,6 @@ fn main() {
                 Err(e) => {
                     let mut sh = shared.lock().unwrap();
                     sh.audio_streak = 0;
-                    sh.audio_state = "failed".into();
                     sh.audio_note = format!("Core Audio reset failed: {}", e);
                     push_event(&mut sh, &format!("core audio reset failed: {}", e));
                 }
@@ -1691,28 +1727,11 @@ fn main() {
                 sh.net_note = report.note();
             }
 
-            // Watchdog status follows the mode and the current streak; a reset
-            // within the last 10 s keeps its own label so the UI can show it.
-            sh.audio_state = if !sh.audio_guard {
-                "off".into()
-            } else if sh.mode == Mode::Off {
-                "off (mode)".into()
-            } else if sh.audio_streak >= audio::SPIKE_SAMPLES {
-                "spike".into()
-            } else {
-                "watching".into()
-            };
-            if sh
-                .audio_last
-                .map(|t| t.elapsed().as_secs() < 10)
-                .unwrap_or(false)
-            {
-                sh.audio_state = "restarted".into();
-            }
-
-            // External tooling reads this file; no need to rewrite it every 2 s.
-            if last_state_write.elapsed() >= Duration::from_secs(10) {
+            // Persist immediately when something user-visible changed; otherwise
+            // the file is only touched every 10 s for external tooling.
+            if sh.dirty || last_state_write.elapsed() >= Duration::from_secs(10) {
                 last_state_write = Instant::now();
+                sh.dirty = false;
                 write_state(&sh);
             }
         }

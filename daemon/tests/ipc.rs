@@ -672,6 +672,28 @@ fn auto_trim_is_on_by_default_strictly_boolean_and_restores_on_disable() {
 }
 
 #[test]
+fn mode_change_is_persisted_immediately_and_off_is_reported_at_once() {
+    let g = start();
+    let _ = ask(&g, "{\"cmd\":\"mode\",\"value\":\"maxcool\"}");
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"mode\":\"maxcool\""), "got {}", r);
+
+    // A crash or shutdown seconds after choosing a mode must not lose it.
+    let state = wait_until(3, || {
+        std::fs::read_to_string(g.dir.join("state.json"))
+            .map(|t| t.contains("\"mode\":\"maxcool\""))
+            .unwrap_or(false)
+    });
+    assert!(state, "mode was not written to state.json immediately");
+
+    // Off must be reflected in the very next reply, not one tick later.
+    let _ = ask(&g, "{\"cmd\":\"mode\",\"value\":\"off\"}");
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"audio_state\":\"off (mode)\""), "got {}", r);
+    assert!(r.contains("\"auto_trim_active\":false"), "got {}", r);
+}
+
+#[test]
 fn network_health_is_reported_read_only() {
     let g = start();
     let r = ask(&g, "{\"cmd\":\"status\"}");

@@ -190,18 +190,21 @@ something other than CPU die temperature and cannot be slowed from userspace.
 
 ## Download
 
-Installers are published as **GitHub Releases** and are not committed to the
-repository:
+Every release is published as a **GitHub Release**, and the current installer
+plus its checksums are *also committed* at the repository root so the DMG can be
+cloned offline:
 
 <https://github.com/procoder317/Thermal-Guard-For-Mac/releases/latest>
 
-Every release attaches `ThermalGuard-<version>.dmg` together with `SHA256SUMS`
-and `MD5SUMS`. Verify the download before opening it:
+That means three checksummed files are tracked in git, refreshed on every version
+bump: `ThermalGuard-<version>.dmg`, `SHA256SUMS` and `MD5SUMS`. Older installers
+are removed from the tree (they stay in git history and in their release). Verify
+the download before opening it:
 
 ```bash
 cd ~/Downloads
-shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.8.0.dmg
-md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.8.0.dmg
+shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.8.1.dmg
+md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.8.1.dmg
 ```
 
 ## Local setup
@@ -242,8 +245,8 @@ Publishing is tag-driven (`.github/workflows/release.yml`). Bump
 `app/Info.plist`, then:
 
 ```bash
-git tag -a v1.8.0 -m "ThermalGuard 1.8.0"   # the tag message becomes the release notes
-git push origin v1.8.0
+git tag -a v1.8.1 -m "ThermalGuard 1.8.1"   # the tag message becomes the release notes
+git push origin v1.8.1
 ```
 
 CI runs the test suite, rebuilds from that commit, and attaches the DMG,
@@ -340,6 +343,9 @@ Small wins that are worth doing by hand:
   `/var/run/thermalguard.sock` (mode 0666, root‑owned service). Per-user
   preferences (animations, transparency) are therefore written by the UI only;
   the root daemon never needs to reach into a user's defaults.
+- Every accepted setting (mode, fan, shields, trimmer, reclaim) is written to
+  `state.json` immediately, not on the 10 s housekeeping tick, so a shutdown or
+  crash seconds after a change can never resurrect an older mode.
 - `policy.rs`, `trim.rs`, `audio.rs`, `memory.rs` and `net.rs` are pure
   functions; all side effects live in `system.rs` / `procs.rs`, so every
   decision (heat, audio reset, reclaim, network verdict) is testable without

@@ -4,3 +4,8 @@ build/
 *.dmg
 MD5SUMS
 SHA256SUMS
+# Exception: the shipped installer and its checksums are tracked on purpose so
+# the DMG can be obtained from a plain clone (keep in sync with the README).
+!ThermalGuard-[0-9]*.dmg
+!MD5SUMS
+!SHA256SUMS
