@@ -83,6 +83,18 @@ Reinstalling macOS does not change #1 or #2 — they are design, not corruption.
   sends exactly one SIGTERM, launchd replaces the engine in about a second, and
   the new PID is verified before the reset is reported. Ten-minute cooldown,
   three resets per rolling hour, and a plain boolean to switch it off.
+- **Background-service trimmer** (default on, every mode except Off):
+  disables and gracefully stops (SIGTERM) only the compiled-in background-only
+  Apple jobs — on-device ML, indexing, Siri analysis and telemetry — never
+  security, MDM, backup or sync. 30 s grace before the first change, one service
+  per tick, SIP refusals backed off, and a service you re-enable is forgotten
+  rather than fought over. Everything is restored when the toggle goes off, the
+  mode is Off, or the daemon restarts.
+- **Network health** (read-only): measures the active link every 30 s — wired vs
+  Wi-Fi, RSSI/noise, negotiated rate, latency to the router and packet loss —
+  and scores it 0–100 with concrete advice. It deliberately never rewrites TCP
+  tunables, DNS servers or radio settings: macOS already auto-tunes them, and a
+  blind change is the quickest way to break connectivity.
 - T2 / VideoToolbox offload guard (default on, every mode except Off): checks
   VideoToolbox directly, so it works on every Mac model, and reports whether
   H.264 and HEVC decode/encode are hardware-accelerated. When a video falls
@@ -188,8 +200,8 @@ and `MD5SUMS`. Verify the download before opening it:
 
 ```bash
 cd ~/Downloads
-shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.6.0.dmg
-md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.6.0.dmg
+shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.7.0.dmg
+md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.7.0.dmg
 ```
 
 ## Local setup
@@ -230,8 +242,8 @@ Publishing is tag-driven (`.github/workflows/release.yml`). Bump
 `app/Info.plist`, then:
 
 ```bash
-git tag -a v1.6.0 -m "ThermalGuard 1.6.0"   # the tag message becomes the release notes
-git push origin v1.6.0
+git tag -a v1.7.0 -m "ThermalGuard 1.7.0"   # the tag message becomes the release notes
+git push origin v1.7.0
 ```
 
 CI runs the test suite, rebuilds from that commit, and attaches the DMG,
@@ -241,7 +253,7 @@ CI runs the test suite, rebuilds from that commit, and attaches the DMG,
 
 ```bash
 cd daemon
-cargo test              # 81 unit + 24 integration (IPC) tests
+cargo test              # 88 unit + 25 integration (IPC) tests
 cargo test --release    # same, optimised build
 cargo run --release -- --memory-probe   # one Mach VM sample + µs per sample
 ```
@@ -295,8 +307,8 @@ locks the fix in. To re-check the guarantees locally:
 4. Pick a mode. Optional: **Start ThermalGuard at login**.
 
 Uninstall: `sudo launchctl bootout system/com.thermalguard.daemon && sudo rm -f /Library/LaunchDaemons/com.thermalguard.daemon.plist /Library/PrivilegedHelperTools/com.thermalguard.daemon`
-If you used the Auto-mode trimmer, turn it off (or leave Auto) first so the
-services are restored; otherwise re-enable them with
+If the background-service trimmer was active, switch it off (or select Off)
+first so the services are restored; otherwise re-enable them with
 `sudo launchctl enable gui/$(id -u)/<label>` for each affected label.
 
 ## Manual wins the app deliberately does not force
@@ -317,9 +329,10 @@ Small wins that are worth doing by hand:
   `/var/run/thermalguard.sock` (mode 0666, root‑owned service). Per-user
   preferences (animations, transparency) are therefore written by the UI only;
   the root daemon never needs to reach into a user's defaults.
-- `policy.rs`, `trim.rs`, `audio.rs` and `memory.rs` are pure functions; all
-  side effects live in `system.rs` / `procs.rs`, so the decision logic is
-  testable without hardware or memory pressure.
+- `policy.rs`, `trim.rs`, `audio.rs`, `memory.rs` and `net.rs` are pure
+  functions; all side effects live in `system.rs` / `procs.rs`, so every
+  decision (heat, audio reset, reclaim, network verdict) is testable without
+  hardware, pressure or a live link.
 - The memory sampler is the one hot path written like driver code: direct Mach
   and `sysctlbyname` FFI, no process spawns, ~15 µs per sample. It only ever
   **reads** kernel counters; the VM subsystem itself stays Apple's.

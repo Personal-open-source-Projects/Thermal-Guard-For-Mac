@@ -370,6 +370,129 @@ pub fn restart_coreaudio() -> Result<String, String> {
     })
 }
 
+/// One measured view of the active link. Read-only: this never changes a
+/// radio, a route or a socket buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct NetProbe {
+    pub link: crate::net::Link,
+    pub interface: [u8; 16],
+    pub interface_len: usize,
+    pub rssi_dbm: Option<f64>,
+    pub noise_dbm: Option<f64>,
+    pub tx_mbps: Option<f64>,
+    pub gateway_ms: Option<f64>,
+    pub loss_pct: f64,
+}
+
+impl NetProbe {
+    pub fn interface(&self) -> String {
+        String::from_utf8_lossy(&self.interface[..self.interface_len]).into_owned()
+    }
+}
+
+const WDUTIL: &str = "/usr/bin/wdutil";
+const ROUTE: &str = "/sbin/route";
+const PING: &str = "/sbin/ping";
+
+fn number_before(text: &str, marker: &str) -> Option<f64> {
+    let rest = text.split(marker).nth(1)?;
+    let start = rest.find(|c: char| c.is_ascii_digit() || c == '-' || c == '.')?;
+    let num: String = rest[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    num.parse::<f64>().ok()
+}
+
+fn ping_gateway(gateway: &str) -> (Option<f64>, f64) {
+    let out = run(PING, &["-c", "3", "-t", "2", gateway]).unwrap_or_default();
+    let loss = out
+        .lines()
+        .find(|l| l.contains("packet loss"))
+        .and_then(|l| number_before(l, "").or_else(|| {
+            l.split('%')
+                .next()
+                .and_then(|p| p.split_whitespace().last())
+                .and_then(|v| v.parse::<f64>().ok())
+        }))
+        .unwrap_or(0.0);
+    let rtt = out
+        .lines()
+        .find(|l| l.contains("round-trip"))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|p| p.trim().split('/').nth(1))
+        .and_then(|v| v.trim().parse::<f64>().ok());
+    (rtt, loss)
+}
+
+/// Measure the active link. Two small child processes (`route`, `ping`) plus
+/// `wdutil` for radio data, run every 30 s — not on the 2 s tick.
+pub fn network_probe() -> Option<NetProbe> {
+    let route = run(ROUTE, &["-n", "get", "default"]).unwrap_or_default();
+    let iface = route
+        .lines()
+        .find(|l| l.trim_start().starts_with("interface:"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if iface.is_empty() {
+        let mut p = NetProbe {
+            link: crate::net::Link::Down,
+            interface: [0; 16],
+            interface_len: 0,
+            rssi_dbm: None,
+            noise_dbm: None,
+            tx_mbps: None,
+            gateway_ms: None,
+            loss_pct: 0.0,
+        };
+        let bytes = b"none";
+        p.interface[..bytes.len()].copy_from_slice(bytes);
+        p.interface_len = bytes.len();
+        return Some(p);
+    }
+
+    let wifi_text = run(WDUTIL, &["info"]).unwrap_or_default();
+    let associated = wifi_text.contains("Link Status: Associated")
+        || wifi_text.contains("RSSI");
+    let link = if associated {
+        crate::net::Link::Wifi
+    } else {
+        crate::net::Link::Wired
+    };
+
+    let rssi_dbm = number_before(&wifi_text, "RSSI");
+    let noise_dbm = number_before(&wifi_text, "Noise");
+    let tx_mbps = number_before(&wifi_text, "Tx Rate");
+    let gateway = route
+        .lines()
+        .find(|l| l.trim_start().starts_with("gateway:"))
+        .and_then(|l| l.split(':').nth(1))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let (gateway_ms, loss_pct) = if gateway.is_empty() {
+        (None, 0.0)
+    } else {
+        ping_gateway(&gateway)
+    };
+
+    let mut p = NetProbe {
+        link,
+        interface: [0; 16],
+        interface_len: 0,
+        rssi_dbm,
+        noise_dbm,
+        tx_mbps,
+        gateway_ms,
+        loss_pct,
+    };
+    let bytes = iface.as_bytes();
+    let n = bytes.len().min(p.interface.len());
+    p.interface[..n].copy_from_slice(&bytes[..n]);
+    p.interface_len = n;
+    Some(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

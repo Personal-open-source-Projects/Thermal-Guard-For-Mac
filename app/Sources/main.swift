@@ -1422,6 +1422,7 @@ struct RootView: View {
                     guardCard
                     effectsCard
                     audioCard
+                    networkCard
                     codecCard
                     chromeCard
                     memoryCard
@@ -1493,7 +1494,7 @@ struct RootView: View {
                     Chip(text: "RAM high", tint: .orange, active: true)
                 }
                 if d.autoTrim {
-                    Chip(text: d.autoTrimActive ? "Auto-trim on" : "Auto-trim (Auto)",
+                    Chip(text: d.autoTrimActive ? "Auto-trim on" : "Auto-trim idle",
                          tint: .purple, active: true)
                 }
                 Spacer(minLength: 0)
@@ -1665,6 +1666,46 @@ struct RootView: View {
                     .foregroundStyle(d.audioState == "failed" ? Color.orange : Color.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+        .cardSurface()
+    }
+
+    private var networkCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            CardTitle(icon: "wifi", text: "Network", trailing: d.netGrade)
+
+            HStack(spacing: 6) {
+                Chip(text: d.netLink.capitalized,
+                     tint: d.netScore >= 70 ? .green : .orange, active: true)
+                Chip(text: "Score \(d.netScore)",
+                     tint: d.netScore >= 70 ? .green : .orange, active: true)
+                if !d.netInterface.isEmpty {
+                    Chip(text: d.netInterface, tint: .secondary, active: false)
+                }
+                if let r = d.netRSSI {
+                    Chip(text: String(format: "%.0f dBm", r), tint: .secondary, active: false)
+                }
+                if let t = d.netTx {
+                    Chip(text: String(format: "%.0f Mbps", t), tint: .secondary, active: false)
+                }
+                Spacer(minLength: 0)
+            }
+
+            if let g = d.netGateway {
+                Text(String(format: "Router %.1f ms · %.1f %% loss", g, d.netLoss))
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(d.netNote)
+                .font(.system(size: 10.5))
+                .foregroundStyle(d.netScore >= 70 ? Color.secondary : Color.orange)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text("Measured every 30 s and read-only: macOS already auto-tunes TCP, so rewriting the link would risk connectivity for no real gain.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .cardSurface()
     }
@@ -1994,7 +2035,7 @@ struct MacOSSheet: View {
                 VStack(spacing: 6) {
                     ToggleRow(
                         title: "Auto-trim safe background services",
-                        subtitle: "Only in Auto mode. Curated background-only Apple jobs; restored when you leave Auto or switch this off.",
+                        subtitle: "On by default and active in every mode except Off. Curated background-only Apple jobs are disabled and their running copies stopped; everything is restored when you switch this off or select Off.",
                         isOn: d.autoTrim
                     ) { d.setAutoTrim($0) }
 
@@ -2181,6 +2222,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var audioState = "watching"
     @Published var audioNote = ""
     @Published var audioRestarts = 0
+
+    // Network health, measured by the daemon (read-only).
+    @Published var netLink = "—"
+    @Published var netInterface = ""
+    @Published var netRSSI: Double?
+    @Published var netTx: Double?
+    @Published var netGateway: Double?
+    @Published var netLoss = 0.0
+    @Published var netScore = 0
+    @Published var netGrade = "—"
+    @Published var netNote = ""
 
     @Published var hint = ""
     @Published var software: [[String: Any]] = []
@@ -2898,13 +2950,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         fanNote = s["fan_note"] as? String ?? ""
         if let m = s["mode"] as? String, m != mode { mode = m }
         if let f = s["fan_intent"] as? String, f != fanIntent { fanIntent = f }
-        autoTrim = s["auto_trim"] as? Bool ?? false
+        autoTrim = s["auto_trim"] as? Bool ?? true
         autoTrimActive = s["auto_trim_active"] as? Bool ?? false
         autoTrimNote = s["auto_trim_note"] as? String ?? ""
         if let a = s["audio_guard"] as? Bool { audioGuard = a }
         audioState = s["audio_state"] as? String ?? "watching"
         audioNote = s["audio_note"] as? String ?? ""
         audioRestarts = s["audio_restarts"] as? Int ?? 0
+        netLink = s["net_link"] as? String ?? "—"
+        netInterface = s["net_interface"] as? String ?? ""
+        netRSSI = s["net_rssi"] as? Double
+        netTx = s["net_tx_mbps"] as? Double
+        netGateway = s["net_gateway_ms"] as? Double
+        netLoss = s["net_loss_pct"] as? Double ?? 0
+        netScore = s["net_score"] as? Int ?? 0
+        netGrade = s["net_grade"] as? String ?? "—"
+        netNote = s["net_note"] as? String ?? ""
         if let r = s["memory_reclaim"] as? Bool { memoryReclaim = r }
         memoryReclaimNote = s["memory_note"] as? String ?? ""
         memoryReclaims = s["memory_reclaims"] as? Int ?? 0

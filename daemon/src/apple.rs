@@ -374,6 +374,31 @@ pub fn auto_safe_ids() -> Vec<&'static str> {
         .collect()
 }
 
+/// Gracefully stop a running auto-safe service after it has been disabled, so
+/// the savings start now rather than at its next launch.
+///
+/// SIGTERM only (the job flushes and exits; launchd does not restart a disabled
+/// service). The id is checked against the compiled-in auto-safe catalog first,
+/// so this can never signal a protected or uncurated process, and nothing from
+/// the IPC wire reaches the signal.
+pub fn stop_running(id: &str) -> bool {
+    if !is_auto_safe(id) {
+        return false;
+    }
+    let uid = system::console_uid();
+    for target in [format!("gui/{}/{}", uid, id), format!("system/{}", id)] {
+        if let Ok(o) = Command::new(launchctl())
+            .args(["kill", "SIGTERM", &target])
+            .output()
+        {
+            if o.status.success() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// `None` means launchd's disabled-state could not be read, so callers must not
 /// guess. An empty `Some` is a valid answer: nothing is explicitly disabled.
 fn disabled_set_raw() -> Option<Vec<String>> {
@@ -535,6 +560,15 @@ pub fn items_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_only_ever_targets_auto_safe_services() {
+        // Nothing is signalled: a non-catalog id returns before launchctl runs.
+        assert!(!stop_running("com.apple.WindowServer"));
+        assert!(!stop_running("com.apple.securityd"));
+        assert!(!stop_running(""));
+        assert!(!stop_running("com.attacker.chosen"));
+    }
 
     #[test]
     fn allowlist_accepts_only_curated_ids() {

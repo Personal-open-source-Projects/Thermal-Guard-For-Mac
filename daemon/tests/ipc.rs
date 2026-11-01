@@ -131,6 +131,9 @@ case "$cmd" in
     fi
     echo '}'
     ;;
+  kill)
+    echo "kill $*" >> "${FAKE_LAUNCHCTL_STATE:?}.kills"
+    ;;
   disable)
     svc="$1"
     label="${svc##*/}"
@@ -581,20 +584,24 @@ fn memory_reclaim_is_strictly_boolean() {
 // ---- Auto-trim integration tests -----------------------------------------
 
 #[test]
-fn auto_trim_is_opt_in_strictly_boolean_and_restores_on_disable() {
+fn auto_trim_is_on_by_default_strictly_boolean_and_restores_on_disable() {
     let fake = fake_launchctl();
     let g = start_with_env(&fake_env(&fake));
 
     let r = ask(&g, "{\"cmd\":\"status\"}");
-    assert!(r.contains("\"auto_trim\":false"), "must default off: {}", r);
+    assert!(r.contains("\"auto_trim\":true"), "must default on: {}", r);
+    assert!(
+        r.contains("\"auto_trim_active\":true"),
+        "active in every mode except Off: {}",
+        r
+    );
     assert!(r.contains("\"auto_trimmed\":[]"), "nothing tracked yet: {}", r);
 
-    // A string is not a boolean: it must not arm the trimmer.
+    // A string is not a boolean: it must not disarm the trimmer.
     let _ = ask(&g, "{\"cmd\":\"auto_trim\",\"value\":\"yes\"}");
     let r = ask(&g, "{\"cmd\":\"status\"}");
-    assert!(r.contains("\"auto_trim\":false"), "strict bool: {}", r);
+    assert!(r.contains("\"auto_trim\":true"), "strict bool: {}", r);
 
-    let _ = ask(&g, "{\"cmd\":\"auto_trim\",\"value\":true}");
     let armed = wait_until(12, || {
         let r = ask(&g, "{\"cmd\":\"status\"}");
         r.contains("\"auto_trim\":true") && !r.contains("\"auto_trimmed\":[]")
@@ -621,6 +628,26 @@ fn auto_trim_is_opt_in_strictly_boolean_and_restores_on_disable() {
         disabled
     );
 
+    // Disabling stops future launches; the running copy is asked to exit too,
+    // by SIGTERM, and only for curated background ids.
+    let kills =
+        std::fs::read_to_string(format!("{}.kills", fake.state.display())).unwrap_or_default();
+    assert!(
+        kills.contains("kill SIGTERM"),
+        "running trimmed services must be stopped gracefully: {:?}",
+        kills
+    );
+    assert!(
+        kills.contains("com.apple."),
+        "only curated ids can be stopped: {:?}",
+        kills
+    );
+    assert!(
+        !kills.contains("WindowServer") && !kills.contains("securityd"),
+        "a protected service was signalled: {:?}",
+        kills
+    );
+
     // Switching it off must hand every tracked service back.
     let _ = ask(&g, "{\"cmd\":\"auto_trim\",\"value\":false}");
     let restored = wait_until(15, || {
@@ -632,6 +659,27 @@ fn auto_trim_is_opt_in_strictly_boolean_and_restores_on_disable() {
         empty_tracked && empty_state
     });
     assert!(restored, "auto-trim did not restore the tracked services");
+
+    // Off mode is the escape hatch: the trimmer steps aside and hands back
+    // anything it disabled, even though the toggle is still on.
+    let _ = ask(&g, "{\"cmd\":\"auto_trim\",\"value\":true}");
+    let _ = ask(&g, "{\"cmd\":\"mode\",\"value\":\"off\"}");
+    let off = wait_until(15, || {
+        let r = ask(&g, "{\"cmd\":\"status\"}");
+        r.contains("\"auto_trim_active\":false") && r.contains("\"auto_trimmed\":[]")
+    });
+    assert!(off, "Off mode must hand every trimmed service back");
+}
+
+#[test]
+fn network_health_is_reported_read_only() {
+    let g = start();
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    for key in ["\"net_link\"", "\"net_score\"", "\"net_grade\"", "\"net_note\""] {
+        assert!(r.contains(key), "missing {} in {}", key, r);
+    }
+    // No silent network writes: there is no tuning state to report.
+    assert!(!r.contains("\"net_tuned\""), "daemon must never rewrite the link: {}", r);
 }
 
 #[test]

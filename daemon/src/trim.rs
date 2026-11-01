@@ -1,4 +1,6 @@
-//! Pure planner for the opt-in Auto-mode service trimmer.
+//! Pure planner for the background-service trimmer.
+//!
+//! Default on, active in every cooling mode except Off, and user-toggleable.
 //!
 //! The planner has no side effects and no clock: the caller supplies the
 //! launchd snapshot, the tracked set and whether the grace period has elapsed.

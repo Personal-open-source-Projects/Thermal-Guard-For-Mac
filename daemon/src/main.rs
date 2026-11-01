@@ -9,6 +9,7 @@ mod apple;
 mod audio;
 mod json;
 mod memory;
+mod net;
 mod policy;
 mod procs;
 mod smc;
@@ -128,7 +129,17 @@ struct Shared {
     memory_note: String,
     memory_advice: memory::Advice,
     memory_trend: memory::Trend,
-    /// User setting: opt-in trimmer for auto-safe macOS background services.
+    net_link: String,
+    net_interface: String,
+    net_rssi: Option<f64>,
+    net_tx_mbps: Option<f64>,
+    net_gateway_ms: Option<f64>,
+    net_loss_pct: f64,
+    net_score: u8,
+    net_grade: String,
+    net_note: String,
+    /// User setting: trimmer for auto-safe macOS background services (on by
+    /// default; it runs in every mode except Off).
     auto_trim: bool,
     /// Services *we* disabled and therefore may restore. Never includes a
     /// service the user disabled by hand.
@@ -190,7 +201,16 @@ impl Default for Shared {
             memory_note: String::new(),
             memory_advice: memory::Advice::Hold,
             memory_trend: memory::Trend::default(),
-            auto_trim: false,
+            net_link: "—".into(),
+            net_interface: String::new(),
+            net_rssi: None,
+            net_tx_mbps: None,
+            net_gateway_ms: None,
+            net_loss_pct: 0.0,
+            net_score: 0,
+            net_grade: "—".into(),
+            net_note: String::new(),
+            auto_trim: true,
             auto_trimmed: Vec::new(),
             auto_trim_note: String::new(),
             trim_grace_until: None,
@@ -360,8 +380,17 @@ fn state_json(sh: &Shared) -> String {
             (sh.memory_trend.compressed_mb_per_s * 10.0).round() / 10.0,
         ),
         json::s("memory_note", &sh.memory_note),
+        json::s("net_link", &sh.net_link),
+        json::s("net_interface", &sh.net_interface),
+        format!("\"net_rssi\":{}", opt_num(sh.net_rssi)),
+        format!("\"net_tx_mbps\":{}", opt_num(sh.net_tx_mbps)),
+        format!("\"net_gateway_ms\":{}", opt_num(sh.net_gateway_ms)),
+        json::n("net_loss_pct", (sh.net_loss_pct * 10.0).round() / 10.0),
+        json::i("net_score", sh.net_score as i64),
+        json::s("net_grade", &sh.net_grade),
+        json::s("net_note", &sh.net_note),
         json::b("auto_trim", sh.auto_trim),
-        json::b("auto_trim_active", sh.auto_trim && sh.mode == Mode::Auto),
+        json::b("auto_trim_active", sh.auto_trim && sh.mode != Mode::Off),
         json::s("auto_trim_note", &sh.auto_trim_note),
         json::str_array("auto_trimmed", &sh.auto_trimmed),
         json::b("cap_active", sh.cap_active),
@@ -644,13 +673,15 @@ fn safe_label(s: &str) -> String {
         .collect()
 }
 
-/// Reconcile the opt-in Auto-mode trimmer with launchd.
+/// Reconcile the background-service trimmer with launchd.
 ///
 /// Called once per daemon tick, so at most one service changes per tick. The
 /// decision itself is pure (`trim::plan`); this function only performs the one
-/// verified side effect it returns and records what we did.
+/// verified side effect it returns and records what we did. It is active in
+/// every cooling mode except Off and only ever touches the compiled-in
+/// background-only catalog.
 fn reconcile_auto_trim(sh: &mut Shared) {
-    let active = sh.auto_trim && sh.mode == Mode::Auto;
+    let active = sh.auto_trim && sh.mode != Mode::Off;
 
     // Nothing to restore and nothing to trim: stay completely idle.
     if !active && sh.auto_trimmed.is_empty() {
@@ -718,8 +749,22 @@ fn reconcile_auto_trim(sh: &mut Shared) {
                 }
                 sh.auto_trimmed.sort();
                 sh.auto_trimmed.dedup();
-                sh.auto_trim_note = format!("Trimmed {}.", id);
-                push_event(sh, &format!("auto-trim: disabled {}", id));
+                // Disabling stops future launches; also stop the copy that is
+                // running now, gracefully, so the saving starts immediately.
+                let stopped = apple::stop_running(&id);
+                sh.auto_trim_note = if stopped {
+                    format!("Trimmed {} and stopped it.", id)
+                } else {
+                    format!("Trimmed {}.", id)
+                };
+                push_event(
+                    sh,
+                    &format!(
+                        "auto-trim: disabled {}{}",
+                        id,
+                        if stopped { " (stopped)" } else { "" }
+                    ),
+                );
             }
             Err(e) => {
                 sh.trim_skip.push((id.clone(), now));
@@ -814,7 +859,7 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
         }
         let body = {
             let sh = shared.lock().unwrap();
-            let active = sh.auto_trim && sh.mode == Mode::Auto;
+            let active = sh.auto_trim && sh.mode != Mode::Off;
             apple::items_json(
                 &apple::scan(),
                 &note,
@@ -933,24 +978,24 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                 let mut sh = shared.lock().unwrap();
                 if sh.auto_trim != on {
                     sh.auto_trim = on;
-                    if on && sh.mode == Mode::Auto {
+                    if on && sh.mode != Mode::Off {
                         let grace = trim_grace_s();
                         sh.trim_grace_until =
                             Some(Instant::now() + Duration::from_secs(grace));
                         sh.auto_trim_note =
                             format!("Auto-trim armed; first action in {} s.", grace);
-                        push_event(&mut sh, "auto-trim armed for Auto mode");
+                        push_event(&mut sh, "auto-trim armed");
                     } else {
                         sh.trim_grace_until = None;
                         sh.auto_trim_note = if on {
-                            "Auto-trim on; it runs only in Auto mode.".into()
+                            "Auto-trim on; it starts when a cooling mode is active.".into()
                         } else {
                             "Auto-trim off; restoring any trimmed services.".into()
                         };
                         push_event(
                             &mut sh,
                             if on {
-                                "auto-trim on (waits for Auto mode)"
+                                "auto-trim on (waits for a cooling mode)"
                             } else {
                                 "auto-trim off"
                             },
@@ -1041,18 +1086,18 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
     {
         let mut sh = shared.lock().unwrap();
         if let Some(m) = apply_mode {
-            let was_auto = sh.mode == Mode::Auto;
+            let was_off = sh.mode == Mode::Off;
             if sh.mode != m {
                 push_event(&mut sh, &format!("mode -> {}", m.label()));
             }
             sh.mode = m;
-            // Arming the trimmer is tied to Auto mode. Entering Auto starts the
-            // grace clock; leaving Auto clears it and lets reconciliation hand
-            // every tracked service back.
-            if m == Mode::Auto && !was_auto && sh.auto_trim {
+            // Any cooling mode keeps the trimmer working; Off hands every
+            // tracked service back. Leaving Off starts the grace clock, so a
+            // mode change never disables a service the same instant.
+            if m != Mode::Off && was_off && sh.auto_trim {
                 let grace = trim_grace_s();
                 sh.trim_grace_until = Some(Instant::now() + Duration::from_secs(grace));
-            } else if m != Mode::Auto {
+            } else if m == Mode::Off {
                 sh.trim_grace_until = None;
             }
             if m == Mode::Off {
@@ -1118,7 +1163,7 @@ fn smc_holder() -> Option<smc::Smc> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        println!("thermalguardd 1.6.0");
+        println!("thermalguardd 1.7.0");
         return;
     }
     if args.iter().any(|a| a == "--memory-probe") {
@@ -1178,7 +1223,7 @@ fn main() {
         let media_guard_off = json::get_bool(&saved, "media_guard") == Some(false);
         let audio_guard_off = json::get_bool(&saved, "audio_guard") == Some(false);
         let memory_reclaim_off = json::get_bool(&saved, "memory_reclaim") == Some(false);
-        let auto_trim = json::get_bool(&saved, "auto_trim") == Some(true);
+        let auto_trim = json::get_bool(&saved, "auto_trim") != Some(false);
         let tracked: Vec<String> = json::get_str_array(&saved, "auto_trimmed")
             .unwrap_or_default()
             .into_iter()
@@ -1197,7 +1242,7 @@ fn main() {
         sh.auto_trimmed = tracked;
         sh.auto_trimmed.sort();
         sh.auto_trimmed.dedup();
-        if sh.auto_trim && sh.mode == Mode::Auto {
+        if sh.auto_trim && sh.mode != Mode::Off {
             // A restart is not an excuse to disable something instantly.
             sh.trim_grace_until = Some(Instant::now() + Duration::from_secs(trim_grace_s()));
         }
@@ -1285,6 +1330,7 @@ fn main() {
     let mut last_mem_scan = Instant::now() - Duration::from_secs(2);
     // Short ring of Mach samples used for the compressor/swap trend.
     let mut mem_samples: Vec<(Instant, f64, f64)> = Vec::new();
+    let mut last_net_scan = Instant::now() - Duration::from_secs(30);
     let mut logged_cap = false;
     // When the power cap last changed hands, so the Auto governor can enforce
     // its dwell time and cannot flap every tick.
@@ -1346,6 +1392,14 @@ fn main() {
                 .collect::<Vec<(f64, f64, f64)>>(),
             memory::TREND_WINDOW_S,
         );
+
+        // The link changes slowly and each probe costs a ping; 30 s is enough.
+        let net = if last_net_scan.elapsed() >= Duration::from_secs(30) {
+            last_net_scan = Instant::now();
+            system::network_probe()
+        } else {
+            None
+        };
 
         let inputs: Vec<(u32, String, f64)> = procs_sample
             .iter()
@@ -1579,6 +1633,26 @@ fn main() {
 
             // Opt-in Auto-mode trimmer: at most one verified change per tick.
             reconcile_auto_trim(&mut sh);
+
+            if let Some(n) = net.as_ref() {
+                let report = net::evaluate(&net::Inputs {
+                    link: n.link,
+                    rssi_dbm: n.rssi_dbm,
+                    noise_dbm: n.noise_dbm,
+                    tx_mbps: n.tx_mbps,
+                    gateway_ms: n.gateway_ms,
+                    loss_pct: n.loss_pct,
+                });
+                sh.net_link = n.link.as_str().to_string();
+                sh.net_interface = n.interface();
+                sh.net_rssi = n.rssi_dbm;
+                sh.net_tx_mbps = n.tx_mbps;
+                sh.net_gateway_ms = n.gateway_ms;
+                sh.net_loss_pct = n.loss_pct;
+                sh.net_score = report.score;
+                sh.net_grade = report.grade.to_string();
+                sh.net_note = report.note();
+            }
 
             // Watchdog status follows the mode and the current streak; a reset
             // within the last 10 s keeps its own label so the UI can show it.
