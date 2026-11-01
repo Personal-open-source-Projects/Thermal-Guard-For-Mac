@@ -1163,7 +1163,7 @@ fn smc_holder() -> Option<smc::Smc> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        println!("thermalguardd 1.7.0");
+        println!("thermalguardd 1.8.0");
         return;
     }
     if args.iter().any(|a| a == "--memory-probe") {
@@ -1327,6 +1327,13 @@ fn main() {
 
     // Main control loop.
     let mut last_demote_scan = Instant::now() - Duration::from_secs(10);
+    let mut cached_speed_limit: Option<u32> = None;
+    let mut last_speed_scan = Instant::now() - Duration::from_secs(10);
+    let mut cached_ac = false;
+    let mut last_ac_scan = Instant::now() - Duration::from_secs(60);
+    let mut last_state_write = Instant::now() - Duration::from_secs(10);
+    let mut cached_batt_temp: Option<f64> = None;
+    let mut last_batt_scan = Instant::now() - Duration::from_secs(60);
     let mut last_mem_scan = Instant::now() - Duration::from_secs(2);
     // Short ring of Mach samples used for the compressor/swap trend.
     let mut mem_samples: Vec<(Instant, f64, f64)> = Vec::new();
@@ -1342,16 +1349,46 @@ fn main() {
         let fan_rpm = read_opt(&smc, "F0Ac");
         let fan_min = read_opt(&smc, "F0Mn");
         let fan_max = read_opt(&smc, "F0Mx");
-        let battery_temp = read_first(&smc, smc::BATTERY_TEMP_KEYS).or_else(system::battery_temp);
-        let speed_limit = system::cpu_speed_limit();
-        let ac = system::on_ac_power();
+        // Battery temperature comes from the SMC when it is there. The `ioreg`
+        // fallback is a process spawn, so it is cached: battery temperature
+        // moves on the order of minutes, not seconds.
+        let battery_temp = match read_first(&smc, smc::BATTERY_TEMP_KEYS) {
+            Some(v) => {
+                cached_batt_temp = Some(v);
+                Some(v)
+            }
+            None => {
+                if last_batt_scan.elapsed() >= Duration::from_secs(15) {
+                    last_batt_scan = Instant::now();
+                    cached_batt_temp = system::battery_temp();
+                }
+                cached_batt_temp
+            }
+        };
+        // `pmset` is a process spawn, so these are cached and refreshed on their
+        // own slower cadence instead of twice per tick. Neither value changes
+        // fast enough for a 2 s sample to buy anything.
+        let speed_limit = if last_speed_scan.elapsed() >= Duration::from_secs(6) {
+            last_speed_scan = Instant::now();
+            cached_speed_limit = system::cpu_speed_limit();
+            cached_speed_limit
+        } else {
+            cached_speed_limit
+        };
+        let ac = if last_ac_scan.elapsed() >= Duration::from_secs(30) {
+            last_ac_scan = Instant::now();
+            cached_ac = system::on_ac_power();
+            cached_ac
+        } else {
+            cached_ac
+        };
 
         let (mode, cap_active) = {
             let sh = shared.lock().unwrap();
             (sh.mode, sh.cap_active)
         };
 
-        let procs_sample = if last_demote_scan.elapsed() >= Duration::from_secs(2) {
+        let procs_sample = if last_demote_scan.elapsed() >= Duration::from_secs(4) {
             last_demote_scan = Instant::now();
             procs::sample(14)
         } else {
@@ -1673,7 +1710,11 @@ fn main() {
                 sh.audio_state = "restarted".into();
             }
 
-            write_state(&sh);
+            // External tooling reads this file; no need to rewrite it every 2 s.
+            if last_state_write.elapsed() >= Duration::from_secs(10) {
+                last_state_write = Instant::now();
+                write_state(&sh);
+            }
         }
 
         thread::sleep(Duration::from_secs(2));

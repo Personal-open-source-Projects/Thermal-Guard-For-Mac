@@ -2215,6 +2215,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var effectsNote = ""
     var effectsOriginals: [String: String] = [:]
     var lastEffectsScan: Date?
+    var lastHelperCheck: Date?
+    var lastAccelScan: Date?
 
     // Core Audio watchdog: the daemon owns the privilege and the decision; the
     // UI only sends a boolean and renders the state it is told.
@@ -2896,27 +2898,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     /// demand from the UI, but not on every 2 s status tick.
     func runUserSpaceGuards() {
         let now = Date()
-        if lastChromeScan.map({ now.timeIntervalSince($0) >= 4 }) ?? true {
+        if lastAccelScan.map({ now.timeIntervalSince($0) >= 8 }) ?? true {
+            lastAccelScan = now
+            refreshAccelerationGuard()
+        }
+        if lastChromeScan.map({ now.timeIntervalSince($0) >= 8 }) ?? true {
             lastChromeScan = now
             refreshChromeGuard()
         }
-        if lastMemoryScan.map({ now.timeIntervalSince($0) >= 10 }) ?? true {
+        if lastMemoryScan.map({ now.timeIntervalSince($0) >= 15 }) ?? true {
             lastMemoryScan = now
             refreshMemoryGuard()
         }
-        if lastCodecScan.map({ now.timeIntervalSince($0) >= 5 }) ?? true {
+        if lastCodecScan.map({ now.timeIntervalSince($0) >= 10 }) ?? true {
             lastCodecScan = now
             refreshCodecGuard()
         }
-        if lastEffectsScan.map({ now.timeIntervalSince($0) >= 10 }) ?? true {
+        if lastEffectsScan.map({ now.timeIntervalSince($0) >= 15 }) ?? true {
             lastEffectsScan = now
             refreshVisualEffects()
         }
     }
 
     func refresh() {
-        refreshAccelerationGuard()
-        helperPresent = helperInstalled()
+        // `launchctl print` is a fork; the helper's presence does not change
+        // every two seconds, so check it on a slow cadence.
+        let now = Date()
+        if lastHelperCheck.map({ now.timeIntervalSince($0) >= 30 }) ?? true {
+            lastHelperCheck = now
+            helperPresent = helperInstalled()
+        }
         loginOn = loginEnabled()
 
         guard let s = requestStatus() else {

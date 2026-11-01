@@ -200,8 +200,8 @@ and `MD5SUMS`. Verify the download before opening it:
 
 ```bash
 cd ~/Downloads
-shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.7.0.dmg
-md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.7.0.dmg
+shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.8.0.dmg
+md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.8.0.dmg
 ```
 
 ## Local setup
@@ -242,8 +242,8 @@ Publishing is tag-driven (`.github/workflows/release.yml`). Bump
 `app/Info.plist`, then:
 
 ```bash
-git tag -a v1.7.0 -m "ThermalGuard 1.7.0"   # the tag message becomes the release notes
-git push origin v1.7.0
+git tag -a v1.8.0 -m "ThermalGuard 1.8.0"   # the tag message becomes the release notes
+git push origin v1.8.0
 ```
 
 CI runs the test suite, rebuilds from that commit, and attaches the DMG,
@@ -257,6 +257,17 @@ cargo test              # 88 unit + 25 integration (IPC) tests
 cargo test --release    # same, optimised build
 cargo run --release -- --memory-probe   # one Mach VM sample + µs per sample
 ```
+
+### Idle cost
+
+Measured on MacBookAir9,1 over a 60 s window with `ps`: the daemon uses about
+0.3 s CPU per minute (≈0.5 % of one core) and 2.6 MB RSS. Temperature, fan and
+SMC readings are sampled every 2 s; `pmset` readings are cached (6 s for the
+speed limit, 30 s for AC), the process scan runs every 4 s, the ioreg battery
+fallback every 15 s, memory is a 15 µs Mach call every 2 s, the network probe
+every 30 s, and the state file is rewritten every 10 s. Log timestamps no longer
+spawn `date`. The UI redraws every 2 s but only forks for its guards on 8–15 s
+cadences, and checks for the helper every 30 s.
 
 What the suite covers: policy hysteresis and mode switching, the
 never-demote/protected-process rules, the curated Apple-service allowlist,

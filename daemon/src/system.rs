@@ -9,7 +9,6 @@ use std::process::Command;
 const PMSET: &str = "/usr/bin/pmset";
 const SYSCTL: &str = "/usr/sbin/sysctl";
 const IOREG: &str = "/usr/sbin/ioreg";
-const DATE: &str = "/bin/date";
 const STAT: &str = "/usr/bin/stat";
 const KILLALL: &str = "/usr/bin/killall";
 const PGREP: &str = "/usr/bin/pgrep";
@@ -313,10 +312,52 @@ pub fn purge_reclaimable() -> Result<(), String> {
     }
 }
 
+#[repr(C)]
+struct Tm {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+    tm_gmtoff: i64,
+    tm_zone: *const c_char,
+}
+
+extern "C" {
+    fn time(t: *mut i64) -> i64;
+    fn localtime_r(t: *const i64, tm: *mut Tm) -> *mut Tm;
+}
+
+/// Local wall-clock time without spawning `/bin/date` on every log line. The
+/// daemon writes events far more often than it writes logs, and each fork on a
+/// laptop is a wakeup that has to be paid for in battery.
 pub fn now_hms() -> String {
-    run(DATE, &["+%H:%M:%S"])
-        .map(|t| t.trim().to_string())
-        .unwrap_or_default()
+    let mut now: i64 = 0;
+    let mut tm = Tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 0,
+        tm_mon: 0,
+        tm_year: 0,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: std::ptr::null(),
+    };
+    let ok = unsafe {
+        time(&mut now);
+        !localtime_r(&now, &mut tm).is_null()
+    };
+    if !ok {
+        return String::new();
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
 /// `/usr/bin/killall` in production. The override exists only for the
