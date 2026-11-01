@@ -6,11 +6,14 @@
 
 mod agents;
 mod apple;
+mod audio;
 mod json;
+mod memory;
 mod policy;
 mod procs;
 mod smc;
 mod system;
+mod trim;
 
 use policy::{FanIntent, Mode};
 use std::io::{BufReader, Read, Write};
@@ -29,7 +32,7 @@ const DEFAULT_RUN_DIR: &str = "/var/run/thermalguard";
 /// Path overrides exist only for the test suite. They are ignored when the
 /// process is root, so the installed daemon can never be redirected by a
 /// planted environment variable to write state or accept commands elsewhere.
-fn overrides_allowed() -> bool {
+pub(crate) fn overrides_allowed() -> bool {
     let is_root = unsafe { geteuid() } == 0;
     if is_root {
         return false;
@@ -59,6 +62,23 @@ fn state_path() -> String {
     format!("{}/state.json", run_dir())
 }
 
+/// How long Auto-trim waits after being armed before the first disable, so the
+/// user can switch it off again before anything changes.
+const TRIM_GRACE_S: u64 = 30;
+/// A service that refused (SIP) is not retried on every tick.
+const TRIM_SIP_BACKOFF_S: u64 = 300;
+
+fn trim_grace_s() -> u64 {
+    if overrides_allowed() {
+        if let Ok(v) = std::env::var("THERMALGUARD_TRIM_GRACE_S") {
+            if let Ok(n) = v.parse::<u64>() {
+                return n;
+            }
+        }
+    }
+    TRIM_GRACE_S
+}
+
 struct Shared {
     mode: Mode,
     fan_intent: FanIntent,
@@ -83,6 +103,40 @@ struct Shared {
     media_active: bool,
     /// User setting: protect call/video apps (never throttle, release the cap).
     media_guard: bool,
+    /// User setting: reset a stuck Core Audio engine (automatic, default on).
+    audio_guard: bool,
+    /// Human-readable watchdog state: watching / spike / restarted / off.
+    audio_state: String,
+    audio_note: String,
+    /// Reset bookkeeping: total, last time, and the rolling-hour window.
+    audio_restarts: u32,
+    audio_last: Option<Instant>,
+    audio_restarts_window: Vec<Instant>,
+    /// Consecutive samples of coreaudiod above the spike threshold.
+    audio_streak: u32,
+    coreaudiod_cpu: Option<f64>,
+    /// User setting: reclaim OS cache under pressure (default on).
+    memory_reclaim: bool,
+    mem_pressure: memory::Pressure,
+    mem_free_pct: f64,
+    mem_compressed_mb: f64,
+    mem_reclaimable_mb: f64,
+    mem_swap_used_pct: f64,
+    memory_reclaims: u32,
+    memory_last: Option<Instant>,
+    memory_window: Vec<Instant>,
+    memory_note: String,
+    /// User setting: opt-in trimmer for auto-safe macOS background services.
+    auto_trim: bool,
+    /// Services *we* disabled and therefore may restore. Never includes a
+    /// service the user disabled by hand.
+    auto_trimmed: Vec<String>,
+    auto_trim_note: String,
+    /// Don't act before this instant (armed, or daemon just started).
+    trim_grace_until: Option<Instant>,
+    /// Services that recently refused a launchctl change (SIP), with the time
+    /// of the refusal, so they are not retried every tick.
+    trim_skip: Vec<(String, Instant)>,
     procs: Vec<procs::Proc>,
     demoted: Vec<(u32, String)>,
     events: Vec<String>,
@@ -114,6 +168,29 @@ impl Default for Shared {
             fan_failed: None,
             media_active: false,
             media_guard: true,
+            audio_guard: true,
+            audio_state: "watching".into(),
+            audio_note: String::new(),
+            audio_restarts: 0,
+            audio_last: None,
+            audio_restarts_window: Vec::new(),
+            audio_streak: 0,
+            coreaudiod_cpu: None,
+            memory_reclaim: true,
+            mem_pressure: memory::Pressure::Normal,
+            mem_free_pct: 0.0,
+            mem_compressed_mb: 0.0,
+            mem_reclaimable_mb: 0.0,
+            mem_swap_used_pct: 0.0,
+            memory_reclaims: 0,
+            memory_last: None,
+            memory_window: Vec::new(),
+            memory_note: String::new(),
+            auto_trim: false,
+            auto_trimmed: Vec::new(),
+            auto_trim_note: String::new(),
+            trim_grace_until: None,
+            trim_skip: Vec::new(),
             procs: Vec::new(),
             demoted: Vec::new(),
             events: Vec::new(),
@@ -257,6 +334,27 @@ fn state_json(sh: &Shared) -> String {
         json::b("ac_power", sh.ac),
         json::b("media_active", sh.media_active),
         json::b("media_guard", sh.media_guard),
+        json::b("audio_guard", sh.audio_guard),
+        json::s("audio_state", &sh.audio_state),
+        json::s("audio_note", &sh.audio_note),
+        json::i("audio_restarts", sh.audio_restarts as i64),
+        format!("\"coreaudiod_cpu\":{}", opt_num(sh.coreaudiod_cpu)),
+        match sh.audio_last {
+            Some(t) => json::i("audio_last_s", t.elapsed().as_secs() as i64),
+            None => "\"audio_last_s\":null".to_string(),
+        },
+        json::b("memory_reclaim", sh.memory_reclaim),
+        json::s("memory_pressure", sh.mem_pressure.as_str()),
+        json::n("memory_free_pct", (sh.mem_free_pct * 10.0).round() / 10.0),
+        json::n("memory_compressed_mb", sh.mem_compressed_mb.round()),
+        json::n("memory_reclaimable_mb", sh.mem_reclaimable_mb.round()),
+        json::n("memory_swap_used_pct", (sh.mem_swap_used_pct * 10.0).round() / 10.0),
+        json::i("memory_reclaims", sh.memory_reclaims as i64),
+        json::s("memory_note", &sh.memory_note),
+        json::b("auto_trim", sh.auto_trim),
+        json::b("auto_trim_active", sh.auto_trim && sh.mode == Mode::Auto),
+        json::s("auto_trim_note", &sh.auto_trim_note),
+        json::str_array("auto_trimmed", &sh.auto_trimmed),
         json::b("cap_active", sh.cap_active),
         json::b("smc_ok", sh.smc_ok),
         json::s("smc_error", &sh.smc_error),
@@ -537,6 +635,108 @@ fn safe_label(s: &str) -> String {
         .collect()
 }
 
+/// Reconcile the opt-in Auto-mode trimmer with launchd.
+///
+/// Called once per daemon tick, so at most one service changes per tick. The
+/// decision itself is pure (`trim::plan`); this function only performs the one
+/// verified side effect it returns and records what we did.
+fn reconcile_auto_trim(sh: &mut Shared) {
+    let active = sh.auto_trim && sh.mode == Mode::Auto;
+
+    // Nothing to restore and nothing to trim: stay completely idle.
+    if !active && sh.auto_trimmed.is_empty() {
+        sh.trim_skip.clear();
+        return;
+    }
+
+    // A tampered state file cannot widen the set: only auto-safe ids survive.
+    sh.auto_trimmed.retain(|id| apple::is_auto_safe(id));
+    sh.auto_trimmed.sort();
+    sh.auto_trimmed.dedup();
+
+    let now = Instant::now();
+    sh.trim_skip
+        .retain(|(_, at)| now.duration_since(*at).as_secs() < TRIM_SIP_BACKOFF_S);
+
+    let states = match apple::service_states() {
+        Some(s) => s,
+        None => {
+            if active {
+                sh.auto_trim_note = "launchd state unreadable; not trimming.".into();
+            }
+            return;
+        }
+    };
+
+    let grace_elapsed = !active
+        || sh
+            .trim_grace_until
+            .map(|t| now >= t)
+            .unwrap_or(true);
+    let blocked: Vec<String> = sh.trim_skip.iter().map(|(id, _)| id.clone()).collect();
+    let auto_safe = apple::auto_safe_ids();
+    let action = trim::plan(
+        active,
+        Some(&states),
+        &sh.auto_trimmed,
+        &auto_safe,
+        grace_elapsed,
+        &blocked,
+    );
+
+    match action {
+        trim::Action::None => {
+            if active && !grace_elapsed {
+                let left = sh
+                    .trim_grace_until
+                    .map(|t| t.saturating_duration_since(now).as_secs())
+                    .unwrap_or(0);
+                sh.auto_trim_note =
+                    format!("Auto-trim armed; first action in {} s.", left.max(1));
+            } else if active {
+                sh.auto_trim_note = format!(
+                    "{} background service(s) trimmed.",
+                    sh.auto_trimmed.len()
+                );
+            } else if sh.auto_trimmed.is_empty() {
+                sh.auto_trim_note = "Nothing trimmed.".into();
+            }
+        }
+        trim::Action::Disable(id) => match apple::set(&id, false) {
+            Ok(_) => {
+                if !sh.auto_trimmed.iter().any(|x| x == &id) {
+                    sh.auto_trimmed.push(id.clone());
+                }
+                sh.auto_trimmed.sort();
+                sh.auto_trimmed.dedup();
+                sh.auto_trim_note = format!("Trimmed {}.", id);
+                push_event(sh, &format!("auto-trim: disabled {}", id));
+            }
+            Err(e) => {
+                sh.trim_skip.push((id.clone(), now));
+                sh.auto_trim_note = format!("Could not trim {}: {}", id, e);
+                push_event(sh, &format!("auto-trim: {} refused: {}", id, e));
+            }
+        },
+        trim::Action::Enable(id) => match apple::set(&id, true) {
+            Ok(_) => {
+                sh.auto_trimmed.retain(|x| x != &id);
+                sh.auto_trim_note = format!("Restored {}.", id);
+                push_event(sh, &format!("auto-trim: restored {}", id));
+            }
+            Err(e) => {
+                sh.trim_skip.push((id.clone(), now));
+                sh.auto_trim_note = format!("Could not restore {}: {}", id, e);
+                push_event(sh, &format!("auto-trim: restore {} failed: {}", id, e));
+            }
+        },
+        trim::Action::Forget(id) => {
+            sh.auto_trimmed.retain(|x| x != &id);
+            sh.auto_trim_note = format!("{} is enabled again; no longer tracked.", id);
+        }
+    }
+}
+
 fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
     if !peer_allowed(&stream) {
         log_line("rejected IPC connection from an unauthorised uid");
@@ -603,7 +803,18 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                 }
             }
         }
-        let body = apple::items_json(&apple::scan(), &note);
+        let body = {
+            let sh = shared.lock().unwrap();
+            let active = sh.auto_trim && sh.mode == Mode::Auto;
+            apple::items_json(
+                &apple::scan(),
+                &note,
+                sh.auto_trim,
+                active,
+                &sh.auto_trimmed,
+                &sh.auto_trim_note,
+            )
+        };
         let _ = stream.write_all(body.as_bytes());
         let _ = stream.write_all(b"\n");
         let _ = stream.flush();
@@ -648,12 +859,97 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
         let _ = stream.write_all(b"\n");
         let _ = stream.flush();
         return;
+    }        // Test-only hook: exercises the OS-level reclaim path with a stub
+        // `purge`, never the real one. Not reachable in a root install.
+        if cmd == "memory_reclaim_now" {
+            let body = if overrides_allowed() {
+                match system::purge_reclaimable() {
+                    Ok(_) => {
+                        let mut sh = shared.lock().unwrap();
+                        sh.memory_reclaims += 1;
+                        sh.memory_last = Some(Instant::now());
+                        sh.memory_window.push(Instant::now());
+                        sh.memory_note = "Reclaimable cache was released (test hook).".into();
+                        push_event(&mut sh, "memory reclaim (test hook)");
+                        state_json(&sh)
+                    }
+                    Err(e) => json::obj(&[json::s("error", &e)]),
+                }
+            } else {
+                json::obj(&[json::s("error", "unsupported")])
+            };
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.write_all(b"\n");
+            let _ = stream.flush();
+            return;
+        }
+
+        // Test-only hook: drives the very same verified reset path with a stub
+    // `killall`, so the end-to-end test never touches the real audio stack.
+    // `overrides_allowed()` is false for the installed root daemon, so this
+    // command cannot exist in production.
+    if cmd == "audio_restart" {
+        let body = if overrides_allowed() {
+            match system::restart_coreaudio() {
+                Ok(note) => {
+                    log_line(&note);
+                    let mut sh = shared.lock().unwrap();
+                    sh.audio_restarts += 1;
+                    sh.audio_last = Some(Instant::now());
+                    sh.audio_restarts_window.push(Instant::now());
+                    sh.audio_streak = 0;
+                    sh.audio_note = note;
+                    sh.audio_state = "restarted".into();
+                    push_event(&mut sh, "core audio reset (test hook)");
+                    state_json(&sh)
+                }
+                Err(e) => json::obj(&[json::s("error", &e)]),
+            }
+        } else {
+            json::obj(&[json::s("error", "unsupported")])
+        };
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.write_all(b"\n");
+        let _ = stream.flush();
+        return;
     }
 
     let mut apply_mode: Option<Mode> = None;
     let mut apply_fan: Option<FanIntent> = None;
 
     match cmd.as_str() {
+        "auto_trim" => {
+            // Strict boolean only: a string such as "yes" must not arm it.
+            if let Some(on) = json::get_bool(&req, "value") {
+                let mut sh = shared.lock().unwrap();
+                if sh.auto_trim != on {
+                    sh.auto_trim = on;
+                    if on && sh.mode == Mode::Auto {
+                        let grace = trim_grace_s();
+                        sh.trim_grace_until =
+                            Some(Instant::now() + Duration::from_secs(grace));
+                        sh.auto_trim_note =
+                            format!("Auto-trim armed; first action in {} s.", grace);
+                        push_event(&mut sh, "auto-trim armed for Auto mode");
+                    } else {
+                        sh.trim_grace_until = None;
+                        sh.auto_trim_note = if on {
+                            "Auto-trim on; it runs only in Auto mode.".into()
+                        } else {
+                            "Auto-trim off; restoring any trimmed services.".into()
+                        };
+                        push_event(
+                            &mut sh,
+                            if on {
+                                "auto-trim on (waits for Auto mode)"
+                            } else {
+                                "auto-trim off"
+                            },
+                        );
+                    }
+                }
+            }
+        }
         "mode" => {
             if let Some(m) = json::get_str(&req, "value").and_then(|v| Mode::parse(&v)) {
                 apply_mode = Some(m);
@@ -687,16 +983,69 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                 }
             }
         }
+        "audio_guard" => {
+            // Strict boolean only: a string must not arm or disarm the watchdog.
+            if let Some(on) = json::get_bool(&req, "value") {
+                let mut sh = shared.lock().unwrap();
+                if sh.audio_guard != on {
+                    sh.audio_guard = on;
+                    sh.audio_streak = 0;
+                    if !on {
+                        sh.audio_state = "off".into();
+                        sh.audio_note = "Core Audio watchdog off; nothing is signalled.".into();
+                    }
+                    push_event(
+                        &mut sh,
+                        if on {
+                            "core audio watchdog on"
+                        } else {
+                            "core audio watchdog off"
+                        },
+                    );
+                }
+            }
+        }
+        "memory_reclaim" => {
+            if let Some(on) = json::get_bool(&req, "value") {
+                let mut sh = shared.lock().unwrap();
+                if sh.memory_reclaim != on {
+                    sh.memory_reclaim = on;
+                    sh.memory_note = if on {
+                        "Cache reclaim on; it runs only under real pressure.".into()
+                    } else {
+                        "Cache reclaim off; nothing is purged.".into()
+                    };
+                    push_event(
+                        &mut sh,
+                        if on {
+                            "memory cache reclaim on"
+                        } else {
+                            "memory cache reclaim off"
+                        },
+                    );
+                }
+            }
+        }
         _ => {}
     }
 
     {
         let mut sh = shared.lock().unwrap();
         if let Some(m) = apply_mode {
+            let was_auto = sh.mode == Mode::Auto;
             if sh.mode != m {
                 push_event(&mut sh, &format!("mode -> {}", m.label()));
             }
             sh.mode = m;
+            // Arming the trimmer is tied to Auto mode. Entering Auto starts the
+            // grace clock; leaving Auto clears it and lets reconciliation hand
+            // every tracked service back.
+            if m == Mode::Auto && !was_auto && sh.auto_trim {
+                let grace = trim_grace_s();
+                sh.trim_grace_until = Some(Instant::now() + Duration::from_secs(grace));
+            } else if m != Mode::Auto {
+                sh.trim_grace_until = None;
+            }
             if m == Mode::Off {
                 // Release everything we ever applied.
                 if sh.cap_active {
@@ -760,7 +1109,7 @@ fn smc_holder() -> Option<smc::Smc> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        println!("thermalguardd 1.0.0");
+        println!("thermalguardd 1.5.0");
         return;
     }
     if args.iter().any(|a| a == "--probe") {
@@ -791,12 +1140,38 @@ fn main() {
     // Restore the last chosen mode so a reboot or daemon restart never quietly
     // drops the user back to an unprotected default.
     if let Ok(saved) = std::fs::read_to_string(state_path()) {
-        if let Some(m) = json::get_str(&saved, "mode").and_then(|v| Mode::parse(&v)) {
-            shared.lock().unwrap().mode = m;
+        let restored_mode = json::get_str(&saved, "mode").and_then(|v| Mode::parse(&v));
+        let media_guard_off = json::get_bool(&saved, "media_guard") == Some(false);
+        let audio_guard_off = json::get_bool(&saved, "audio_guard") == Some(false);
+        let memory_reclaim_off = json::get_bool(&saved, "memory_reclaim") == Some(false);
+        let auto_trim = json::get_bool(&saved, "auto_trim") == Some(true);
+        let tracked: Vec<String> = json::get_str_array(&saved, "auto_trimmed")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| apple::is_auto_safe(id))
+            .collect();
+
+        let mut sh = shared.lock().unwrap();
+        if let Some(m) = restored_mode {
+            sh.mode = m;
             log_line(&format!("restored mode {}", m.as_str()));
         }
-        if saved.contains("\"media_guard\":false") {
-            shared.lock().unwrap().media_guard = false;
+        sh.media_guard = !media_guard_off;
+        sh.audio_guard = !audio_guard_off;
+        sh.memory_reclaim = !memory_reclaim_off;
+        sh.auto_trim = auto_trim;
+        sh.auto_trimmed = tracked;
+        sh.auto_trimmed.sort();
+        sh.auto_trimmed.dedup();
+        if sh.auto_trim && sh.mode == Mode::Auto {
+            // A restart is not an excuse to disable something instantly.
+            sh.trim_grace_until = Some(Instant::now() + Duration::from_secs(trim_grace_s()));
+        }
+        if !sh.auto_trimmed.is_empty() {
+            sh.auto_trim_note = format!(
+                "{} service(s) tracked from the last run.",
+                sh.auto_trimmed.len()
+            );
         }
     }
 
@@ -873,6 +1248,7 @@ fn main() {
 
     // Main control loop.
     let mut last_demote_scan = Instant::now() - Duration::from_secs(10);
+    let mut last_mem_scan = Instant::now() - Duration::from_secs(10);
     let mut logged_cap = false;
     // When the power cap last changed hands, so the Auto governor can enforce
     // its dwell time and cannot flap every tick.
@@ -905,6 +1281,22 @@ fn main() {
         let media_active = procs_sample
             .iter()
             .any(|p| p.cpu >= 6.0 && procs::is_media(&p.name));
+
+        // coreaudiod is protected from demotion, so its own CPU share is a
+        // clean signal: a healthy engine idles near zero.
+        let coreaudiod_cpu = procs_sample
+            .iter()
+            .find(|p| p.name.contains("coreaudiod"))
+            .map(|p| p.cpu);
+
+        // Memory is sampled slower than the CPU: the compressor moves on the
+        // order of seconds, and this is two extra process spawns.
+        let mem = if last_mem_scan.elapsed() >= Duration::from_secs(10) {
+            last_mem_scan = Instant::now();
+            system::memory_stats()
+        } else {
+            None
+        };
 
         let inputs: Vec<(u32, String, f64)> = procs_sample
             .iter()
@@ -981,6 +1373,120 @@ fn main() {
             }
         }
 
+        // 3) Core Audio watchdog. The decision is made under the lock and the
+        //    signal is sent outside it, so the UI is never blocked behind a
+        //    restart and the policy stays a pure function.
+        let audio_action = {
+            let mut sh = shared.lock().unwrap();
+            sh.coreaudiod_cpu = coreaudiod_cpu;
+            sh.audio_streak = audio::spike_streak(sh.audio_streak, coreaudiod_cpu);
+            sh.audio_restarts_window
+                .retain(|t| t.elapsed().as_secs() < 3600);
+            let inputs = audio::Inputs {
+                enabled: sh.audio_guard,
+                mode_off: sh.mode == Mode::Off,
+                spike_streak: sh.audio_streak,
+                since_last_s: sh
+                    .audio_last
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(u64::MAX),
+                restarts_last_hour: sh.audio_restarts_window.len() as u32,
+            };
+            audio::plan(&inputs)
+        };
+        if audio_action == audio::Action::Restart {
+            match system::restart_coreaudio() {
+                Ok(note) => {
+                    let mut sh = shared.lock().unwrap();
+                    sh.audio_restarts += 1;
+                    sh.audio_last = Some(Instant::now());
+                    sh.audio_restarts_window.push(Instant::now());
+                    sh.audio_streak = 0;
+                    sh.audio_note = note;
+                    sh.audio_state = "restarted".into();
+                    push_event(
+                        &mut sh,
+                        "core audio engine reset after a sustained spike",
+                    );
+                }
+                Err(e) => {
+                    let mut sh = shared.lock().unwrap();
+                    sh.audio_streak = 0;
+                    sh.audio_state = "failed".into();
+                    sh.audio_note = format!("Core Audio reset failed: {}", e);
+                    push_event(&mut sh, &format!("core audio reset failed: {}", e));
+                }
+            }
+        }
+
+        // 4) OS-level memory reclamation. Decided under the lock, performed
+        //    outside it, then measured: a purge that freed nothing must not be
+        //    reported as a success.
+        let memory_action = {
+            let mut sh = shared.lock().unwrap();
+            if let Some(m) = mem {
+                let free_pct = if m.total_mb > 0.0 {
+                    m.free_mb / m.total_mb * 100.0
+                } else {
+                    0.0
+                };
+                let compressed_pct = if m.total_mb > 0.0 {
+                    m.compressed_mb / m.total_mb * 100.0
+                } else {
+                    0.0
+                };
+                sh.mem_pressure =
+                    memory::pressure_level(m.kernel_pressure, free_pct, m.swap_used_pct, compressed_pct);
+                sh.mem_free_pct = free_pct;
+                sh.mem_compressed_mb = m.compressed_mb;
+                sh.mem_reclaimable_mb = m.reclaimable_mb;
+                sh.mem_swap_used_pct = m.swap_used_pct;
+            }
+            sh.memory_window.retain(|t| t.elapsed().as_secs() < 3600);
+            let inputs = memory::Inputs {
+                enabled: sh.memory_reclaim,
+                mode_off: sh.mode == Mode::Off,
+                pressure: sh.mem_pressure,
+                reclaimable_mb: sh.mem_reclaimable_mb,
+                swap_used_pct: sh.mem_swap_used_pct,
+                since_last_s: sh
+                    .memory_last
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(u64::MAX),
+                reclaims_last_hour: sh.memory_window.len() as u32,
+            };
+            memory::plan(&inputs)
+        };
+        if memory_action == memory::Action::Purge {
+            match system::purge_reclaimable() {
+                Ok(_) => {
+                    let after = system::memory_stats();
+                    let note = match (mem, after) {
+                        (Some(b), Some(a)) => format!(
+                            "Reclaimed {:.0} MB of cache (free {:.0} -> {:.0} MB, compressed {:.0} -> {:.0} MB).",
+                            (b.reclaimable_mb - a.reclaimable_mb).max(0.0),
+                            b.free_mb,
+                            a.free_mb,
+                            b.compressed_mb,
+                            a.compressed_mb
+                        ),
+                        _ => "Purgeable and file-backed cache was released.".to_string(),
+                    };
+                    let mut sh = shared.lock().unwrap();
+                    sh.memory_reclaims += 1;
+                    sh.memory_last = Some(Instant::now());
+                    sh.memory_window.push(Instant::now());
+                    sh.memory_note = note.clone();
+                    push_event(&mut sh, &format!("memory reclaim: {}", note));
+                }
+                Err(e) => {
+                    let mut sh = shared.lock().unwrap();
+                    sh.memory_note = format!("Memory reclaim failed: {}", e);
+                    push_event(&mut sh, &format!("memory reclaim failed: {}", e));
+                }
+            }
+        }
+
         {
             let mut sh = shared.lock().unwrap();
             sh.cpu_temp = cpu_temp;
@@ -1015,6 +1521,28 @@ fn main() {
             sh.demoted.retain(|(p, _)| hot.contains(p));
 
             drive_fan(&smc, &mut sh, cpu_temp);
+
+            // Opt-in Auto-mode trimmer: at most one verified change per tick.
+            reconcile_auto_trim(&mut sh);
+
+            // Watchdog status follows the mode and the current streak; a reset
+            // within the last 10 s keeps its own label so the UI can show it.
+            sh.audio_state = if !sh.audio_guard {
+                "off".into()
+            } else if sh.mode == Mode::Off {
+                "off (mode)".into()
+            } else if sh.audio_streak >= audio::SPIKE_SAMPLES {
+                "spike".into()
+            } else {
+                "watching".into()
+            };
+            if sh
+                .audio_last
+                .map(|t| t.elapsed().as_secs() < 10)
+                .unwrap_or(false)
+            {
+                sh.audio_state = "restarted".into();
+            }
 
             write_state(&sh);
         }

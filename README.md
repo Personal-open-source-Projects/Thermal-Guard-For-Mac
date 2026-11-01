@@ -14,9 +14,9 @@ on and dismissed by clicking anywhere outside it — no separate title-bar
 window, and the bottom of the content can never fall off-screen. Inside: a
 thermal ring
 that fills with the die temperature, live fan / clock / battery / SMC readings,
-a status strip of chips (mode, cap, OS throttling, call shield), then mode and
-fan pickers, the video & call guard, a live per-process CPU card, and recent
-events. One accent colour runs through the whole window and follows the
+a status strip of chips (mode, cap, OS throttling, call shield, T2 offload, RAM
+pressure, auto-trim), then mode and fan pickers, the video & call guard, the
+T2, Chrome and memory cards, a live per-process CPU card, and recent events. One accent colour runs through the whole window and follows the
 machine: teal → green → orange → red. Software and macOS-service management
 open as sheets, with a confirmation before anything is disabled.
 
@@ -50,6 +50,42 @@ Reinstalling macOS does not change #1 or #2 — they are design, not corruption.
   as it stops hogging.
 - **Never touches:** third-party security agents and peripheral drivers,
   XProtect, `syspolicyd`, `securityd`, MDM, and the window server / kernel.
+- Chrome background guard (opt-in, default on, user-toggleable): when Chrome is
+  genuinely idle it is asked to quit gracefully, its own background mode is
+  switched off, the three known Google updater/Keystone agents are disabled, and
+  leftover helper processes are sent SIGTERM only after their executable path is
+  re-verified. Everything is restored when Chrome is used again or the toggle
+  is turned off.
+- Graceful memory guard (default on, every mode except Off): under real memory
+  pressure, idle user apps with no window and 10 minutes (5 at critical
+  pressure) of inactivity are asked to quit gracefully. Nothing is force-killed
+  and protected, frontmost, audio, camera or busy apps are never candidates.
+  Before any app is touched the daemon measures the compressor, swap and the
+  reclaimable (purgeable + file-backed) cache, and it takes its pressure band
+  from the kernel's own verdict (`kern.memorystatus_vm_pressure_level`) rather
+  than a free-page percentage — macOS keeps free pages low on purpose. Only when
+  the kernel reports warning/critical pressure, at least 1 GB is reclaimable and
+  swap is below 70 % does it release that cache with one verified `purge` —
+  30-minute cooldown, at most twice an hour, never in Off mode. So the order is:
+  let the kernel compress and swap, drop cache we can actually prove is
+  reclaimable, and only then ask idle apps to quit.
+- **Reduced animations & visual effects** (default on, every mode except Off):
+  writes the three macOS switches that cost the Intel Iris Plus the most —
+  Reduce Motion, Reduce Transparency and automatic window animations — and puts
+  the user's own values back (including "the key was never set") when the
+  toggle is switched off or the mode is Off. These are per-user preferences, so
+  the unprivileged UI writes them and the root daemon never does.
+- **Core Audio watchdog** (default on, every mode except Off): when
+  `coreaudiod` stays above 20 % CPU for two consecutive samples — the shape of
+  a stuck audio engine behind stuttering playback and a fan spike — the daemon
+  sends exactly one SIGTERM, launchd replaces the engine in about a second, and
+  the new PID is verified before the reset is reported. Ten-minute cooldown,
+  three resets per rolling hour, and a plain boolean to switch it off.
+- T2 / VideoToolbox offload guard (default on, every mode except Off): checks
+  VideoToolbox directly, so it works on every Mac model, and reports whether
+  H.264 and HEVC decode/encode are hardware-accelerated. When a video falls
+  back to software decode it offers a link to h264ify; it never installs a
+  browser extension.
 - Reports honestly when a fan target is ignored (MacBookAir9,1).
 
 ### Modes
@@ -91,10 +127,14 @@ no restarts, no config writes, no polls beyond the existing 2 s dashboard tick.
 Headless entry points, also used to test it:
 
 ```bash
-ThermalGuard --self-test      # 8 unit tests over the decision table
+ThermalGuard --self-test      # 47 unit tests over the decision tables
 ThermalGuard --media-pulse    # {"video":false,"camera":true}, exit 0 while a session is live
 ThermalGuard --accel-check    # every watch app + its usage, exit 3 if any is off
 ThermalGuard --accel-fix      # repairs what is owed, holding during a live session
+ThermalGuard --chrome-check    # Chrome background guard state and intended action
+ThermalGuard --memory-check    # memory pressure and idle-app candidates
+ThermalGuard --codec-check     # VideoToolbox H.264/HEVC capability and verdict
+ThermalGuard --effects-check   # reduce-motion/transparency/animation switches and their values
 ```
 
 ### Calls and video are protected (automatic)
@@ -146,8 +186,8 @@ and `MD5SUMS`. Verify the download before opening it:
 
 ```bash
 cd ~/Downloads
-shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.2.0.dmg
-md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.2.0.dmg
+shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.5.0.dmg
+md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.5.0.dmg
 ```
 
 ## Local setup
@@ -188,8 +228,8 @@ Publishing is tag-driven (`.github/workflows/release.yml`). Bump
 `app/Info.plist`, then:
 
 ```bash
-git tag -a v1.2.0 -m "ThermalGuard 1.2.0"   # the tag message becomes the release notes
-git push origin v1.2.0
+git tag -a v1.5.0 -m "ThermalGuard 1.5.0"   # the tag message becomes the release notes
+git push origin v1.5.0
 ```
 
 CI runs the test suite, rebuilds from that commit, and attaches the DMG,
@@ -206,8 +246,17 @@ cargo test --release    # same, optimised build
 What the suite covers: policy hysteresis and mode switching, the
 never-demote/protected-process rules, the curated Apple-service allowlist,
 launchd path validation (no caller-supplied paths), socket permissions,
-oversized/truncated requests, handler-panic isolation, label sanitisation, and
+oversized/truncated requests, handler-panic isolation, label sanitisation, the
+Core Audio watchdog's rate limits and SIGTERM-only reset path (against a stub
+`killall`, never the real engine), the memory-reclaim brakes (`memory::*`), and
 the full JSON contract the UI depends on.
+
+The Swift side adds 69 unit tests over the acceleration, Chrome, memory, codec
+and reduced-effects decision tables (`ThermalGuard --self-test`), plus read-only
+headless checks (`--chrome-check`, `--memory-check`, `--codec-check`,
+`--effects-check`). One of those tests runs the defaults write / read-back /
+restore loop against a scratch preference domain, so the plumbing is covered
+without touching a real system setting.
 
 ## Security testing
 
@@ -243,6 +292,9 @@ locks the fix in. To re-check the guarantees locally:
 4. Pick a mode. Optional: **Start ThermalGuard at login**.
 
 Uninstall: `sudo launchctl bootout system/com.thermalguard.daemon && sudo rm -f /Library/LaunchDaemons/com.thermalguard.daemon.plist /Library/PrivilegedHelperTools/com.thermalguard.daemon`
+If you used the Auto-mode trimmer, turn it off (or leave Auto) first so the
+services are restored; otherwise re-enable them with
+`sudo launchctl enable gui/$(id -u)/<label>` for each affected label.
 
 ## Manual wins the app deliberately does not force
 
@@ -259,12 +311,18 @@ Small wins that are worth doing by hand:
 ## Design notes (LLD)
 
 - One privileged daemon, one unprivileged UI. IPC = newline‑delimited JSON over
-  `/var/run/thermalguard.sock` (mode 0666, root‑owned service).
-- `policy.rs` is a pure function; all side effects live in `system.rs` /
-  `procs.rs`, so the decision logic is testable without hardware.
+  `/var/run/thermalguard.sock` (mode 0666, root‑owned service). Per-user
+  preferences (animations, transparency) are therefore written by the UI only;
+  the root daemon never needs to reach into a user's defaults.
+- `policy.rs`, `trim.rs` and `audio.rs` are pure functions; all side effects
+  live in `system.rs` / `procs.rs`, so the decision logic is testable without
+  hardware — including "may this audio engine be reset?"
 - Hysteresis on the cap (82 → 72 °C) prevents mode flapping.
 - Every write is verified: fan target by read‑back, power cap by re‑reading
   `pmset -g custom`, demotion by return value. Failures are logged, not hidden.
+- `visualEffectCatalog` is a data table, not a chain of conditionals: adding a
+  fourth switch is one entry, and it automatically gets the record/restore
+  handling. `effectChange` is pure; only `reconcileVisualEffects` writes.
 - Log: `/var/log/thermalguard.log`; state: `/var/run/thermalguard/state.json`.
 
 ### Decision layer
@@ -294,7 +352,9 @@ Invariants the code and tests enforce:
 - **Media guard relaxes only the extra clamping** — never the safety limit —
   and only on a known temperature below 84 °C.
 - Demotion only ever touches *unprotected* processes and is reversible; nothing
-  is killed or suspended.
+  is killed or suspended. The Chrome guard is the only path that sends a
+  signal, and only SIGTERM to a Chrome helper whose executable path was
+  re-verified immediately beforehand.
 
 ## Known limits
 

@@ -30,22 +30,47 @@ impl Drop for Guard {
 }
 
 fn start() -> Guard {
+    let dir = unique_dir("tg-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    start_in(dir, &[])
+}
+
+fn start_with_env(envs: &[(&str, String)]) -> Guard {
+    let dir = unique_dir("tg-test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    start_in(dir, envs)
+}
+
+fn unique_dir(prefix: &str) -> PathBuf {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("tg-test-{}-{}-{}", std::process::id(), n, stamp));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::env::temp_dir().join(format!(
+        "{}-{}-{}-{}",
+        prefix,
+        std::process::id(),
+        n,
+        stamp
+    ))
+}
+
+fn start_in(dir: PathBuf, envs: &[(&str, String)]) -> Guard {
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("tg.sock");
+    let _ = std::fs::remove_file(&sock);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_thermalguardd"))
-        .env("THERMALGUARD_TESTING", "1")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_thermalguardd"));
+    cmd.env("THERMALGUARD_TESTING", "1")
         .env("THERMALGUARD_SOCK", &sock)
-        .env("THERMALGUARD_RUN_DIR", &dir)
-        .spawn()
-        .expect("daemon should start");
+        .env("THERMALGUARD_RUN_DIR", &dir);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().expect("daemon should start");
 
     let guard = Guard { child, sock, dir };
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -56,6 +81,89 @@ fn start() -> Guard {
         std::thread::sleep(Duration::from_millis(80));
     }
     panic!("daemon socket never appeared at {:?}", guard.sock);
+}
+
+fn wait_until<F: FnMut() -> bool>(secs: u64, mut f: F) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+/// A fake `launchctl` so the Auto-trim integration tests never touch the real
+/// machine. It implements only the three verbs `apple.rs` uses and keeps its
+/// disabled set in a file.
+struct FakeLaunchctl {
+    dir: PathBuf,
+    script: PathBuf,
+    state: PathBuf,
+}
+
+impl Drop for FakeLaunchctl {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn fake_launchctl() -> FakeLaunchctl {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_dir("tg-fake-launchctl");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("launchctl");
+    let state = dir.join("disabled");
+    let body = r#"#!/bin/sh
+set -eu
+state="${FAKE_LAUNCHCTL_STATE:?}"
+cmd="$1"
+shift || true
+case "$cmd" in
+  print-disabled)
+    echo 'disabled services = {'
+    if [ -f "$state" ]; then
+      while IFS= read -r label; do
+        [ -n "$label" ] && echo "    \"$label\" => disabled"
+      done < "$state"
+    fi
+    echo '}'
+    ;;
+  disable)
+    svc="$1"
+    label="${svc##*/}"
+    touch "$state"
+    grep -qxF "$label" "$state" || echo "$label" >> "$state"
+    ;;
+  enable)
+    svc="$1"
+    label="${svc##*/}"
+    touch "$state"
+    grep -vxF "$label" "$state" > "$state.tmp" || true
+    mv "$state.tmp" "$state"
+    ;;
+  *) exit 0 ;;
+esac
+"#;
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    FakeLaunchctl { dir, script, state }
+}
+
+fn fake_env(f: &FakeLaunchctl) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "THERMALGUARD_LAUNCHCTL",
+            f.script.to_string_lossy().into_owned(),
+        ),
+        ("THERMALGUARD_TRIM_GRACE_S", "0".to_string()),
+        (
+            "FAKE_LAUNCHCTL_STATE",
+            f.state.to_string_lossy().into_owned(),
+        ),
+    ]
 }
 
 fn ask(g: &Guard, body: &str) -> String {
@@ -343,3 +451,220 @@ fn labels_with_control_characters_are_neutralised() {
         reply
     );
 }
+
+// ---- Core Audio watchdog integration tests --------------------------------
+
+/// A fake `killall` so the reset path can be exercised end to end without ever
+/// signalling the real audio daemon. It records its argv and succeeds.
+fn fake_killall() -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_dir("tg-fake-killall");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("killall");
+    let log = dir.join("calls");
+    let body = "#!/bin/sh\necho \"$@\" >> \"${FAKE_KILLALL_LOG:?}\"\nexit 0\n";
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script, log)
+}
+
+#[test]
+fn audio_watchdog_is_on_by_default_and_togglable() {
+    let g = start();
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"audio_guard\":true"), "watchdog must default on: {}", r);
+    assert!(r.contains("\"audio_state\""), "state missing: {}", r);
+    assert!(r.contains("\"audio_restarts\":0"), "counter missing: {}", r);
+
+    let _ = ask(&g, "{\"cmd\":\"audio_guard\",\"value\":false}");
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"audio_guard\":false"), "got {}", r);
+
+    // A string is not a boolean: it must not re-arm the watchdog.
+    let _ = ask(&g, "{\"cmd\":\"audio_guard\",\"value\":\"yes\"}");
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"audio_guard\":false"), "strict bool: {}", r);
+
+    let _ = ask(&g, "{\"cmd\":\"audio_guard\",\"value\":true}");
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"audio_guard\":true"), "got {}", r);
+}
+
+#[test]
+fn audio_reset_path_uses_sigterm_and_is_verified() {
+    let (script, log) = fake_killall();
+    let g = start_with_env(&[
+        ("THERMALGUARD_KILLALL", script.to_string_lossy().into_owned()),
+        ("FAKE_KILLALL_LOG", log.to_string_lossy().into_owned()),
+    ]);
+
+    let reply = ask(&g, "{\"cmd\":\"audio_restart\"}");
+    assert!(
+        reply.contains("\"audio_restarts\":1"),
+        "reset not recorded: {}",
+        reply
+    );
+    assert!(
+        reply.contains("coreaudiod") || reply.contains("Core Audio"),
+        "no verification note: {}",
+        reply
+    );
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains("-TERM coreaudiod"),
+        "expected one graceful SIGTERM, got {:?}",
+        calls
+    );
+    assert_eq!(calls.lines().count(), 1, "more than one signal: {:?}", calls);
+    let _ = std::fs::remove_dir_all(script.parent().unwrap());
+}
+
+// ---- Memory reclaim integration tests -------------------------------------
+
+fn fake_purge() -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_dir("tg-fake-purge");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("purge");
+    let log = dir.join("calls");
+    let body = "#!/bin/sh\nprintf '%s' \"$*\" >> \"${FAKE_PURGE_LOG:?}\"\nexit 0\n";
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script, log)
+}
+
+#[test]
+fn memory_reclaim_path_runs_without_arguments_and_is_verified() {
+    let (script, log) = fake_purge();
+    let g = start_with_env(&[
+        ("THERMALGUARD_PURGE", script.to_string_lossy().into_owned()),
+        ("FAKE_PURGE_LOG", log.to_string_lossy().into_owned()),
+    ]);
+
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"memory_reclaim\":true"), "default on: {}", r);
+
+    let reply = ask(&g, "{\"cmd\":\"memory_reclaim_now\"}");
+    assert!(
+        reply.contains("\"memory_reclaims\":1"),
+        "reclaim not recorded: {}",
+        reply
+    );
+    assert!(
+        reply.contains("Reclaimable cache was released"),
+        "no verification note: {}",
+        reply
+    );
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.trim().is_empty(),
+        "purge must be given no caller input, got {:?}",
+        calls
+    );
+    let _ = std::fs::remove_dir_all(script.parent().unwrap());
+}
+
+#[test]
+fn memory_reclaim_is_strictly_boolean() {
+    let g = start();
+    let _ = ask(&g, "{\"cmd\":\"memory_reclaim\",\"value\":\"yes\"}");
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"memory_reclaim\":true"), "strict bool: {}", r);
+
+    let _ = ask(&g, "{\"cmd\":\"memory_reclaim\",\"value\":false}");
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"memory_reclaim\":false"), "got {}", r);
+}
+
+// ---- Auto-trim integration tests -----------------------------------------
+
+#[test]
+fn auto_trim_is_opt_in_strictly_boolean_and_restores_on_disable() {
+    let fake = fake_launchctl();
+    let g = start_with_env(&fake_env(&fake));
+
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"auto_trim\":false"), "must default off: {}", r);
+    assert!(r.contains("\"auto_trimmed\":[]"), "nothing tracked yet: {}", r);
+
+    // A string is not a boolean: it must not arm the trimmer.
+    let _ = ask(&g, "{\"cmd\":\"auto_trim\",\"value\":\"yes\"}");
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"auto_trim\":false"), "strict bool: {}", r);
+
+    let _ = ask(&g, "{\"cmd\":\"auto_trim\",\"value\":true}");
+    let armed = wait_until(12, || {
+        let r = ask(&g, "{\"cmd\":\"status\"}");
+        r.contains("\"auto_trim\":true") && !r.contains("\"auto_trimmed\":[]")
+    });
+    assert!(armed, "auto-trim never disabled a service");
+
+    let r = ask(&g, "{\"cmd\":\"apple\"}");
+    assert!(r.contains("\"auto_trim\":true"), "got {}", r);
+    assert!(r.contains("\"auto_trim_active\":true"), "got {}", r);
+    assert!(r.contains("\"auto_safe\":true"), "got {}", r);
+    assert!(r.contains("\"auto_managed\":true"), "got {}", r);
+    assert!(r.contains("\"auto_trimmed\":[\""), "got {}", r);
+
+    let disabled = std::fs::read_to_string(&fake.state).unwrap_or_default();
+    assert!(
+        disabled.lines().any(|l| l.starts_with("com.apple.")),
+        "expected a curated service in {:?}: {}",
+        fake.state,
+        disabled
+    );
+    assert!(
+        disabled.lines().all(|l| !l.contains("WindowServer") && !l.contains("securityd")),
+        "a protected service was touched: {}",
+        disabled
+    );
+
+    // Switching it off must hand every tracked service back.
+    let _ = ask(&g, "{\"cmd\":\"auto_trim\",\"value\":false}");
+    let restored = wait_until(15, || {
+        let r = ask(&g, "{\"cmd\":\"status\"}");
+        let empty_tracked = r.contains("\"auto_trimmed\":[]");
+        let empty_state = std::fs::read_to_string(&fake.state)
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
+        empty_tracked && empty_state
+    });
+    assert!(restored, "auto-trim did not restore the tracked services");
+}
+
+#[test]
+fn tampered_tracked_ids_cannot_touch_non_auto_safe_services() {
+    let fake = fake_launchctl();
+    let dir = unique_dir("tg-tamper");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("state.json"),
+        r#"{"mode":"auto","media_guard":true,"auto_trim":true,"auto_trimmed":["com.apple.WindowServer","com.apple.bird"]}"#,
+    )
+    .unwrap();
+
+    let g = start_in(dir, &fake_env(&fake));
+
+    // The valid auto-safe work still proceeds, proving the daemon is alive.
+    let trimmed = wait_until(12, || {
+        let r = ask(&g, "{\"cmd\":\"status\"}");
+        !r.contains("\"auto_trimmed\":[]")
+    });
+    assert!(trimmed, "valid auto-trim did not proceed");
+
+    let disabled = std::fs::read_to_string(&fake.state).unwrap_or_default();
+    assert!(
+        !disabled.contains("WindowServer") && !disabled.contains("com.apple.bird"),
+        "tampered ids reached launchctl: {}",
+        disabled
+    );
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(
+        !r.contains("com.apple.WindowServer") && !r.contains("com.apple.bird"),
+        "tampered ids were restored/tracked: {}",
+        r
+    );
+}
+

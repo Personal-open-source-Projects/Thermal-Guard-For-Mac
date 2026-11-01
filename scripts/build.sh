@@ -19,6 +19,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 xcrun -sdk macosx swiftc -O \
   -target x86_64-apple-macosx13.0 \
   -framework AppKit -framework Foundation -framework CoreMediaIO -framework SwiftUI \
+  -framework CoreGraphics -framework CoreMedia -framework VideoToolbox \
   -o "$APP/Contents/MacOS/ThermalGuard" \
   "$ROOT/app/Sources/main.swift"
 

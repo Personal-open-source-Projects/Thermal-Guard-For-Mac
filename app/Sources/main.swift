@@ -1,8 +1,12 @@
 import AppKit
 import Combine
+import CoreGraphics
 import CoreMediaIO
+import CoreMedia
+import Darwin
 import Foundation
 import SwiftUI
+import VideoToolbox
 
 let SOCK_PATH = "/var/run/thermalguard.sock"
 let HELPER_LABEL = "com.thermalguard.daemon"
@@ -183,6 +187,75 @@ func cpuFor(_ tag: String, in sample: String) -> Double {
     return total
 }
 
+// MARK: - Shared process/window inspection
+
+/// A normal, visible, non-zero window owned by `pid`. `.optionAll` includes
+/// off-screen and minimised windows, so an app with a minimised document is not
+/// mistaken for an app with nothing open.
+func hasNormalWindow(pid: pid_t) -> Bool {
+    guard let list = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]] else {
+        return false
+    }
+    for w in list {
+        guard let owner = w[kCGWindowOwnerPID as String] as? Int, pid_t(owner) == pid else { continue }
+        let layer = w[kCGWindowLayer as String] as? Int ?? 0
+        if layer != 0 { continue }
+        if let alpha = w[kCGWindowAlpha as String] as? Double, alpha <= 0.01 { continue }
+        if let bounds = w[kCGWindowBounds as String] as? [String: Any],
+           let width = bounds["Width"] as? Double,
+           let height = bounds["Height"] as? Double,
+           width > 2, height > 2 {
+            return true
+        }
+    }
+    return false
+}
+
+func processPath(pid: pid_t) -> String? {
+    let out = shell("/bin/ps", ["-p", "\(pid)", "-o", "comm="]).1
+    let path = out.trimmingCharacters(in: .whitespacesAndNewlines)
+    return path.isEmpty ? nil : path
+}
+
+/// PIDs that currently hold an audio assertion. Used to avoid quitting an app
+/// that is playing music or is in a call.
+func audioAssertionPids() -> Set<pid_t> {
+    let out = shell("/usr/bin/pmset", ["-g", "assertions"]).1
+    var pids = Set<pid_t>()
+    for raw in out.split(separator: "\n") {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        guard line.hasPrefix("pid "), line.lowercased().contains("audio") else { continue }
+        let rest = line.dropFirst(4)
+        guard let open = rest.firstIndex(of: "("), let pid = pid_t(rest[..<open]) else { continue }
+        pids.insert(pid)
+    }
+    return pids
+}
+
+func cpuByPid() -> [pid_t: Double] {
+    let out = shell("/bin/ps", ["-Ao", "pid=,pcpu="]).1
+    var map = [pid_t: Double]()
+    for line in out.split(separator: "\n") {
+        let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        guard parts.count == 2, let pid = pid_t(parts[0]), let cpu = Double(parts[1]) else { continue }
+        map[pid] = cpu
+    }
+    return map
+}
+
+func topMemoryApps(_ limit: Int = 3) -> [[String: Any]] {
+    let out = shell("/bin/ps", ["-Ao", "pid=,rss=,comm=", "-m"]).1
+    var rows: [[String: Any]] = []
+    for line in out.split(separator: "\n") {
+        let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+        guard parts.count == 3, let pid = Int(parts[0]), let rss = Double(parts[1]) else { continue }
+        let name = (String(parts[2]) as NSString).lastPathComponent
+        rows.append(["pid": pid, "mb": rss / 1024.0, "name": name])
+        if rows.count >= limit { break }
+    }
+    return rows
+}
+
 func accelStatus(_ app: AcceleratedApp, sample: String) -> AccelStatus {
     var s = AccelStatus(app: app)
     s.installed = appURL(app) != nil
@@ -330,6 +403,758 @@ func enableAcceleration(_ app: AcceleratedApp, relaunch: Bool) -> (Bool, String)
         NSWorkspace.shared.openApplication(at: u, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
     }
     return (true, relaunch && wasRunning ? "\(app.name) fixed and relaunched." : "\(app.name) fixed.")
+}
+
+// MARK: - Chrome background guard
+//
+// Chrome keeps a background mode and three Google launch agents alive even
+// when no window is open. This guard is deliberately conservative about what
+// "not in use" means: no window, not frontmost, no audio assertion, no GPU
+// decode, and not still launching. Only then is Chrome asked to quit
+// gracefully, its own background mode is switched off, and leftover helpers
+// are sent SIGTERM after their executable path is re-verified.
+
+let chromeBundleID = "com.google.Chrome"
+let chromeAppPath = "/Applications/Google Chrome.app"
+let chromeMainExecutable = chromeAppPath + "/Contents/MacOS/Google Chrome"
+let googleBackgroundAgents = [
+    "com.google.GoogleUpdater.wake",
+    "com.google.keystone.agent",
+    "com.google.keystone.xpcservice",
+]
+
+struct ChromeGuardState {
+    var installed = false
+    var running = false
+    var launching = false
+    var frontmost = false
+    var hasWindow = false
+    var audio = false
+    var media = false
+    var bgReadable = true
+    var bgEnabled: Bool?
+    var helperPids: [pid_t] = []
+    var active: Bool { running && (launching || frontmost || hasWindow || audio || media) }
+}
+
+enum ChromeGuardAction: Equatable {
+    case nothing
+    case trim
+    case restore
+}
+
+/// Pure policy: the only place that decides whether Chrome is fair game.
+func chromeGuardAction(_ s: ChromeGuardState, enabled: Bool, managed: Bool) -> ChromeGuardAction {
+    guard enabled else { return managed ? .restore : .nothing }
+    guard s.installed else { return managed ? .restore : .nothing }
+    if s.active { return managed ? .restore : .nothing }
+    return .trim
+}
+
+func isChromeHelperPath(_ path: String) -> Bool {
+    guard path.contains("/Google Chrome.app/Contents/") else { return false }
+    if path == chromeMainExecutable { return false }
+    let lower = path.lowercased()
+    return lower.contains("helper") || lower.contains("chrome_crashpad_handler")
+}
+
+func chromeHelperPids() -> [pid_t] {
+    let out = shell("/bin/ps", ["-Ao", "pid=,comm="]).1
+    var pids: [pid_t] = []
+    for line in out.split(separator: "\n") {
+        let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        guard parts.count == 2, let pid = pid_t(parts[0]) else { continue }
+        if isChromeHelperPath(String(parts[1])) { pids.append(pid) }
+    }
+    return pids
+}
+
+func chromeLocalStateURL() -> URL {
+    appStateURL(acceleratedApps[0])
+}
+
+func chromeBackgroundMode() -> (readable: Bool, enabled: Bool?) {
+    guard let data = try? Data(contentsOf: chromeLocalStateURL()),
+          let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        return (false, nil)
+    }
+    if let bg = obj["background_mode"] as? [String: Any],
+       let on = bg["enabled"] as? Bool {
+        return (true, on)
+    }
+    return (true, nil)
+}
+
+func readChromeLocalState() -> (URL, [String: Any])? {
+    let url = chromeLocalStateURL()
+    guard let data = try? Data(contentsOf: url),
+          let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        return nil
+    }
+    return (url, obj)
+}
+
+func writeChromeLocalState(_ obj: [String: Any], to url: URL) -> Bool {
+    guard let out = try? JSONSerialization.data(withJSONObject: obj, options: []) else { return false }
+    let tmp = url.appendingPathExtension("thermalguard-tmp")
+    do {
+        try out.write(to: tmp, options: .atomic)
+        if FileManager.default.fileExists(atPath: url.path) {
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        } else {
+            try FileManager.default.moveItem(at: tmp, to: url)
+        }
+        return true
+    } catch {
+        try? FileManager.default.removeItem(at: tmp)
+        return false
+    }
+}
+
+func chromeBgManaged() -> Bool {
+    UserDefaults.standard.bool(forKey: "chromeBgManaged")
+}
+
+func setChromeBgManaged(_ on: Bool) {
+    UserDefaults.standard.set(on, forKey: "chromeBgManaged")
+}
+
+func chromeManagedAgents() -> [String] {
+    UserDefaults.standard.stringArray(forKey: "chromeManagedAgents") ?? []
+}
+
+func setChromeManagedAgents(_ labels: [String]) {
+    UserDefaults.standard.set(labels, forKey: "chromeManagedAgents")
+}
+
+/// Disable only the three known Google background agents, and remember exactly
+/// which ones were changed so restoration is exact. `launchctl disable` is
+/// persistent and per-user, so this is fully reversible with `enable`.
+func disableGoogleAgents() -> [String] {
+    var managed = Set(chromeManagedAgents())
+    var changed: [String] = []
+    for label in googleBackgroundAgents {
+        let target = "gui/\(getuid())/\(label)"
+        if shell("/bin/launchctl", ["disable", target]).0 == 0 {
+            managed.insert(label)
+            changed.append(label)
+        }
+    }
+    if !changed.isEmpty { setChromeManagedAgents(managed.sorted()) }
+    return changed
+}
+
+/// Re-enable only the labels this app disabled. Anything the user disabled
+/// independently is never in the managed set and is never touched. The stored
+/// list is re-filtered against the compiled-in catalog so a tampered preference
+/// cannot make us enable an arbitrary service.
+func restoreGoogleAgents() -> Bool {
+    var managed = Set(chromeManagedAgents().filter { googleBackgroundAgents.contains($0) })
+    var ok = true
+    for label in Array(managed) {        let target = "gui/\(getuid())/\(label)"
+        if shell("/bin/launchctl", ["enable", target]).0 == 0 {
+            managed.remove(label)
+        } else {
+            ok = false
+        }
+    }
+    setChromeManagedAgents(managed.sorted())
+    return ok
+}
+
+/// Switch Chrome's own background mode off, saving the original value first so
+/// the change is fully reversible.
+@discardableResult
+func disableChromeBackground() -> Bool {
+    guard let (url, state) = readChromeLocalState() else { return false }
+    var obj = state
+    let alreadyManaged = chromeBgManaged()
+    let original = obj["background_mode"]
+    obj["background_mode"] = ["enabled": false]
+    guard writeChromeLocalState(obj, to: url) else { return false }
+    if !alreadyManaged {
+        if let original = original,
+           let data = try? JSONSerialization.data(withJSONObject: original) {
+            UserDefaults.standard.set(true, forKey: "chromeBgOriginalPresent")
+            UserDefaults.standard.set(data, forKey: "chromeBgOriginal")
+        } else {
+            UserDefaults.standard.set(false, forKey: "chromeBgOriginalPresent")
+            UserDefaults.standard.removeObject(forKey: "chromeBgOriginal")
+        }
+        setChromeBgManaged(true)
+    }
+    return true
+}
+
+@discardableResult
+func restoreChromeBackground() -> Bool {
+    guard chromeBgManaged() else { return true }
+    guard let (url, state) = readChromeLocalState() else {
+        setChromeBgManaged(false)
+        return true
+    }
+    var obj = state
+    if UserDefaults.standard.bool(forKey: "chromeBgOriginalPresent"),
+       let data = UserDefaults.standard.data(forKey: "chromeBgOriginal"),
+       let original = try? JSONSerialization.jsonObject(with: data) {
+        obj["background_mode"] = original
+    } else {
+        obj.removeValue(forKey: "background_mode")
+    }
+    guard writeChromeLocalState(obj, to: url) else { return false }
+    setChromeBgManaged(false)
+    UserDefaults.standard.removeObject(forKey: "chromeBgOriginal")
+    UserDefaults.standard.set(false, forKey: "chromeBgOriginalPresent")
+    return true
+}
+
+func chromeGuardState(sample: String) -> ChromeGuardState {
+    var s = ChromeGuardState()
+    s.installed = FileManager.default.fileExists(atPath: chromeAppPath)
+    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: chromeBundleID)
+    s.running = !apps.isEmpty
+    s.launching = apps.contains { !$0.isFinishedLaunching }
+    if let app = apps.first {
+        let pid = app.processIdentifier
+        s.frontmost = app.isActive
+        s.hasWindow = hasNormalWindow(pid: pid)
+        s.audio = audioAssertionPids().contains(pid)
+    }
+    // Attribute media work to Chrome specifically: its GPU helper doing real
+    // work, or a live camera anywhere in the system.
+    s.media = cpuFor("Google Chrome Helper (GPU)", in: sample) >= APP_IN_USE_CPU || cameraInUse()
+    let bg = chromeBackgroundMode()
+    s.bgReadable = bg.readable
+    s.bgEnabled = bg.enabled
+    s.helperPids = chromeHelperPids()
+    return s
+}
+
+func stopChromeHelpers() -> Int {
+    var stopped = 0
+    for pid in chromeHelperPids() {
+        // PID reuse guard: re-read the executable immediately before signalling.
+        guard let path = processPath(pid: pid), isChromeHelperPath(path) else { continue }
+        if kill(pid, SIGTERM) == 0 { stopped += 1 }
+    }
+    return stopped
+}
+
+// MARK: - Graceful memory guard
+//
+// macOS already compresses and swaps memory. The safe extra lever is to ask
+// genuinely idle apps to quit gracefully under real pressure. Nothing is
+// force-killed, and apps with windows, audio, camera, CPU work or a recent
+// interaction are never candidates.
+
+enum MemoryPressure: String {
+    case normal, high, critical
+}
+
+struct MemoryStats {
+    var readable = false
+    var freePercent: Double = 0
+    var swapUsedMB: Double = 0
+    var swapTotalMB: Double = 0
+    var compressedMB: Double = 0
+    var totalMB: Double = 0
+    var pressure: MemoryPressure = .normal
+}
+
+struct MemoryAppState {
+    var bundleID: String
+    var name: String
+    var pid: pid_t
+    var protectedApp = false
+    var hasWindow = false
+    var frontmost = false
+    var audio = false
+    var media = false
+    var cpu: Double = 0
+}
+
+/// Pure pressure classification. Thresholds are deliberately conservative:
+/// macOS is allowed to use most of RAM for cache before we act.
+func memoryPressureLevel(freePercent: Double, swapUsedPercent: Double, compressedPercent: Double) -> MemoryPressure {
+    guard freePercent.isFinite else { return .critical }
+    if freePercent < 8 || swapUsedPercent >= 80 || compressedPercent >= 60 { return .critical }
+    if freePercent < 15 || swapUsedPercent >= 50 || compressedPercent >= 45 { return .high }
+    return .normal
+}
+
+/// Pure candidate policy. A high-pressure event waits 10 minutes of idleness;
+/// a critical one waits 5. The app can still refuse to quit.
+func shouldQuitIdleApp(
+    _ app: MemoryAppState,
+    pressure: MemoryPressure,
+    enabled: Bool,
+    idleFor: Double,
+    refused: Bool
+) -> Bool {
+    guard enabled, pressure != .normal, !refused else { return false }
+    guard !app.protectedApp, !app.hasWindow, !app.frontmost, !app.audio, !app.media else { return false }
+    guard app.cpu < 3.0 else { return false }
+    let threshold: Double = pressure == .critical ? 300 : 600
+    return idleFor >= threshold
+}
+
+func megabytes(_ token: Substring) -> Double {
+    var text = String(token)
+    var multiplier = 1.0
+    if text.hasSuffix("G") {
+        multiplier = 1024
+        text.removeLast()
+    } else if text.hasSuffix("M") {
+        text.removeLast()
+    } else if text.hasSuffix("K") {
+        multiplier = 1.0 / 1024.0
+        text.removeLast()
+    }
+    return (Double(text) ?? 0) * multiplier
+}
+
+func swapValue(_ text: String, label: String) -> Double {
+    guard let range = text.range(of: "\(label) = ") else { return 0 }
+    let token = text[range.upperBound...].split(separator: " ", maxSplits: 1).first ?? ""
+    return megabytes(token)
+}
+
+func memoryStats() -> MemoryStats {
+    var s = MemoryStats()
+    let out = shell("/usr/bin/vm_stat", []).1
+    var pageSize = 4096.0
+    var free = 0.0
+    var active = 0.0
+    var inactive = 0.0
+    var speculative = 0.0
+    var wired = 0.0
+    var compressor = 0.0
+
+    for raw in out.split(separator: "\n") {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("Mach Virtual Memory Statistics") {
+            if let r = line.range(of: "page size of "),
+               let end = line[r.upperBound...].firstIndex(of: " ") {
+                pageSize = Double(line[r.upperBound..<end]) ?? pageSize
+            }
+            continue
+        }
+        let parts = line.split(separator: ":", maxSplits: 1)
+        guard parts.count == 2 else { continue }
+        let key = parts[0].trimmingCharacters(in: .whitespaces)
+        let rawValue = parts[1].trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ".", with: "")
+        let value = Double(rawValue) ?? 0
+        switch key {
+        case "Pages free": free = value
+        case "Pages active": active = value
+        case "Pages inactive": inactive = value
+        case "Pages speculative": speculative = value
+        case "Pages wired down": wired = value
+        case "Pages occupied by compressor": compressor = value
+        default: break
+        }
+    }
+
+    let total = free + active + inactive + speculative + wired + compressor
+    guard total > 0 else { return s }
+    s.readable = true
+    s.totalMB = total * pageSize / 1_048_576
+    s.compressedMB = compressor * pageSize / 1_048_576
+    s.freePercent = (free + inactive + speculative) / total * 100
+
+    let swap = shell("/usr/sbin/sysctl", ["vm.swapusage"]).1
+    s.swapTotalMB = swapValue(swap, label: "total")
+    s.swapUsedMB = swapValue(swap, label: "used")
+
+    let swapUsedPercent = s.swapTotalMB > 0 ? s.swapUsedMB / s.swapTotalMB * 100 : 0
+    let compressedPercent = s.totalMB > 0 ? s.compressedMB / s.totalMB * 100 : 0
+    s.pressure = memoryPressureLevel(
+        freePercent: s.freePercent,
+        swapUsedPercent: swapUsedPercent,
+        compressedPercent: compressedPercent
+    )
+    return s
+}
+
+let memoryProtectedBundleIDs: Set<String> = [
+    "com.apple.finder",
+    "com.apple.dock",
+    "com.apple.SystemUIServer",
+    "com.apple.controlcenter",
+    "com.apple.notificationcenterui",
+    "com.apple.loginwindow",
+    "com.apple.SecurityAgent",
+    "com.apple.CoreServicesUIAgent",
+    "com.apple.universalaccessd",
+    "com.apple.ScreenTimeAgent",
+    "com.apple.familycontrols.useragent",
+    "com.thermalguard.app",
+    chromeBundleID,
+]
+
+let memoryProtectedFragments = [
+    "bitdefender",
+    "wacom",
+    "xprotect",
+    "mdm",
+    "endpointsecurity",
+    "security",
+    "thermalguard",
+]
+
+func isProtectedMemoryApp(_ app: NSRunningApplication) -> Bool {
+    let bundle = app.bundleIdentifier ?? ""
+    if memoryProtectedBundleIDs.contains(bundle) { return true }
+    let name = (app.localizedName ?? "").lowercased()
+    let path = (app.bundleURL?.path ?? "").lowercased()
+    return memoryProtectedFragments.contains { name.contains($0) || path.contains($0) }
+}
+
+func memoryAppStates(sample: String) -> [MemoryAppState] {
+    let audio = audioAssertionPids()
+    let cpu = cpuByPid()
+    let camera = cameraInUse()
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    var rows: [MemoryAppState] = []
+
+    for app in NSWorkspace.shared.runningApplications {
+        guard app.activationPolicy == .regular,
+              app.isFinishedLaunching,
+              app.processIdentifier > 0,
+              let bundleURL = app.bundleURL else { continue }
+        let path = bundleURL.path
+        // Only user-facing bundles. System UI and agents are not candidates.
+        guard path.hasPrefix("/Applications/") || path.hasPrefix(home + "/Applications/") else { continue }
+        let pid = app.processIdentifier
+        let bundle = app.bundleIdentifier ?? "pid-\(pid)"
+        rows.append(MemoryAppState(
+            bundleID: bundle,
+            name: app.localizedName ?? bundle,
+            pid: pid,
+            protectedApp: isProtectedMemoryApp(app),
+            hasWindow: hasNormalWindow(pid: pid),
+            frontmost: app.isActive,
+            audio: audio.contains(pid),
+            media: camera,
+            cpu: cpu[pid] ?? 0
+        ))
+    }
+    return rows
+}
+
+func doubleMap(_ key: String) -> [String: Double] {
+    let raw = UserDefaults.standard.dictionary(forKey: key) ?? [:]
+    var out: [String: Double] = [:]
+    for (k, v) in raw {
+        if let d = v as? Double {
+            out[k] = d
+        } else if let n = v as? NSNumber {
+            out[k] = n.doubleValue
+        }
+    }
+    return out
+}
+
+func saveDoubleMap(_ key: String, _ map: [String: Double]) {
+    UserDefaults.standard.set(map, forKey: key)
+}
+
+// MARK: - T2 / VideoToolbox hardware offload guard
+//
+// VideoToolbox is the source of truth: it reports whether this Mac's hardware
+// can decode/encode H.264 and HEVC. That makes the guard work on every model,
+// not just MacBookAir9,1. When a video is playing we compare the hardware
+// pipeline with the observed work; a software fallback is surfaced honestly.
+// The one thing we cannot do safely is silently install a browser extension,
+// so the h264ify recommendation is a link, never an automatic install.
+
+enum CodecVerdict: Equatable {
+    case unavailable
+    case ready(h264: Bool, hevc: Bool)
+    case hardwareOffload
+    case softwareDecode
+}
+
+func codecVerdict(h264: Bool, hevc: Bool, videoActive: Bool, hardwareActive: Bool) -> CodecVerdict {
+    if !h264 { return .unavailable }
+    if videoActive { return hardwareActive ? .hardwareOffload : .softwareDecode }
+    return .ready(h264: h264, hevc: hevc)
+}
+
+/// VideoToolbox has no public `VTIsHardwareEncodeSupported`, so ask its encoder
+/// list directly. This is the same capability source the encoder itself uses and
+/// works on every Mac model, including Macs without a T2.
+func hardwareEncodeSupported(_ codec: CMVideoCodecType) -> Bool {
+    var list: CFArray?
+    guard VTCopyVideoEncoderList(nil, &list) == noErr,
+          let encoders = list as? [[String: Any]] else { return false }
+    for encoder in encoders {
+        guard let raw = encoder[kVTVideoEncoderList_CodecType as String] as? Int,
+              CMVideoCodecType(raw) == codec else { continue }
+        if let hw = encoder[kVTVideoEncoderList_IsHardwareAccelerated as String] as? Bool, hw {
+            return true
+        }
+    }
+    return false
+}
+
+func codecHardwareSupport() -> (h264Decode: Bool, h264Encode: Bool, hevcDecode: Bool, hevcEncode: Bool) {
+    (
+        VTIsHardwareDecodeSupported(kCMVideoCodecType_H264),
+        hardwareEncodeSupported(kCMVideoCodecType_H264),
+        VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC),
+        hardwareEncodeSupported(kCMVideoCodecType_HEVC)
+    )
+}
+
+struct BrowserExtensionStatus {
+    var installed = false
+    var enabled = false
+    var profiles: [String] = []
+}
+
+/// Detect h264ify/h26ify in Chromium profiles. This is read-only: ThermalGuard
+/// never installs or enables a browser extension on its own.
+func h264ifyStatus(for app: AcceleratedApp) -> BrowserExtensionStatus {
+    var status = BrowserExtensionStatus()
+    let base = appStateURL(app).deletingLastPathComponent()
+    let fm = FileManager.default
+    guard let profiles = try? fm.contentsOfDirectory(at: base, includingPropertiesForKeys: nil) else {
+        return status
+    }
+    let h264ifyID = "aleakchihdccplidncghkekgioiakgal"
+
+    for profile in profiles where profile.hasDirectoryPath {
+        let extDir = profile.appendingPathComponent("Extensions")
+        guard let extensions = try? fm.contentsOfDirectory(at: extDir, includingPropertiesForKeys: nil) else {
+            continue
+        }
+        for ext in extensions {
+            let extID = ext.lastPathComponent
+            var matched = extID == h264ifyID
+            if !matched, let versions = try? fm.contentsOfDirectory(at: ext, includingPropertiesForKeys: nil) {
+                for version in versions {
+                    let manifest = version.appendingPathComponent("manifest.json")
+                    if let data = try? Data(contentsOf: manifest),
+                       let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                       let name = obj["name"] as? String,
+                       name.lowercased().contains("h264ify") || name.lowercased().contains("h26ify") {
+                        matched = true
+                    }
+                }
+            }
+            if !matched { continue }
+            status.installed = true
+            status.profiles.append(profile.lastPathComponent)
+            let prefs = profile.appendingPathComponent("Preferences")
+            if let data = try? Data(contentsOf: prefs),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let extensions = obj["extensions"] as? [String: Any],
+               let settings = extensions["settings"] as? [String: Any],
+               let entry = settings[extID] as? [String: Any],
+               let state = entry["state"] as? Int,
+               state == 1 {
+                status.enabled = true
+            }
+        }
+    }
+    return status
+}
+
+func h264ifyStatusAll() -> BrowserExtensionStatus {
+    var combined = BrowserExtensionStatus()
+    for app in acceleratedApps {
+        guard appURL(app) != nil else { continue }
+        let s = h264ifyStatus(for: app)
+        combined.installed = combined.installed || s.installed
+        combined.enabled = combined.enabled || s.enabled
+        combined.profiles.append(contentsOf: s.profiles)
+    }
+    combined.profiles = Array(Set(combined.profiles)).sorted()
+    return combined
+}
+
+// MARK: - Reduced visual effects
+//
+// Sequoia's compositor draws live blurred materials, zoom/parallax motion and
+// window animations on the GPU every frame, which is the heaviest steady load
+// the Intel Iris Plus in this Air carries. The macOS switches that turn those
+// off are per-user preferences, so they are written here in the unprivileged UI
+// process and never by the root daemon.
+//
+// The design mirrors the Chrome guard: a compiled-in catalogue plus a pure
+// decision function, with the original value of every key recorded before it is
+// changed (including "the key did not exist"), so switching the guard off puts
+// the machine back exactly as it was. Only known boolean keys are written; a key
+// holding another type is reported and left alone rather than converted.
+
+/// What a preference currently holds.
+enum DefaultState: Equatable {
+    /// The key does not exist in that domain.
+    case missing
+    /// A boolean, as macOS stores them (`defaults read` prints 0/1).
+    case flag(Bool)
+    /// Present, but not a boolean: never overwritten, never restored over.
+    case other
+}
+
+/// The single change to make to one preference.
+enum EffectChange: Equatable {
+    case write(Bool)
+    case restore(Bool)
+    case restoreMissing
+    case leave
+}
+
+/// One curated macOS preference that switches off a GPU-expensive effect.
+struct VisualEffectSetting: Equatable {
+    let id: String
+    let domain: String
+    let key: String
+    let title: String
+    /// The value that turns the effect off.
+    let reduced: Bool
+}
+
+/// All three live in NSGlobalDomain and are read live by AppKit, so no logout
+/// or Dock restart is needed for them to take effect.
+let visualEffectCatalog: [VisualEffectSetting] = [
+    .init(id: "reduceMotion", domain: "NSGlobalDomain", key: "reduceMotion",
+          title: "Reduce Motion", reduced: true),
+    .init(id: "reduceTransparency", domain: "NSGlobalDomain", key: "reduceTransparency",
+          title: "Reduce Transparency", reduced: true),
+    .init(id: "windowAnimations", domain: "NSGlobalDomain", key: "NSAutomaticWindowAnimationsEnabled",
+          title: "Window animations", reduced: false),
+]
+
+/// Pure: should the reduced-effects profile be in force?
+///
+/// Same rule as the other user-space guards: on in every cooling mode except
+/// Off. It is deliberately not temperature-driven — a preference change is not
+/// free (apps reload it), so the profile must be stable rather than flap.
+func effectsDesired(enabled: Bool, mode: String) -> Bool {
+    enabled && mode != "off"
+}
+
+/// Pure decision for one preference.
+///
+/// `original` is what was recorded *before* the guard first changed the key;
+/// `nil` means nothing was recorded, so there is nothing to hand back.
+func effectChange(_ setting: VisualEffectSetting,
+                  current: DefaultState,
+                  reduce: Bool,
+                  original: DefaultState?) -> EffectChange {
+    if reduce {
+        switch current {
+        case .missing: return .write(setting.reduced)
+        case .flag(let value): return value == setting.reduced ? .leave : .write(setting.reduced)
+        case .other: return .leave
+        }
+    }
+    // Someone else changed the type since we wrote it: that value is theirs.
+    guard let original, current != .other else { return .leave }
+    switch original {
+    case .flag(let value): return current == .flag(value) ? .leave : .restore(value)
+    case .missing: return current == .missing ? .leave : .restoreMissing
+    case .other: return .leave
+    }
+}
+
+/// Persisted form of a recorded original. `nil` means "do not record this".
+func encodeDefaultState(_ state: DefaultState) -> String? {
+    switch state {
+    case .missing: return "missing"
+    case .flag(let value): return value ? "true" : "false"
+    case .other: return nil
+    }
+}
+
+func decodeDefaultState(_ raw: String) -> DefaultState {
+    switch raw {
+    case "true": return .flag(true)
+    case "false": return .flag(false)
+    default: return .missing
+    }
+}
+
+/// `defaults read` exits non-zero for a missing key or domain, which is exactly
+/// the "absent" state a restore has to reproduce.
+func readDefault(domain: String, key: String) -> DefaultState {
+    let (code, out) = shell("/usr/bin/defaults", ["read", domain, key])
+    guard code == 0 else { return .missing }
+    switch out.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "1", "true", "yes": return .flag(true)
+    case "0", "false", "no": return .flag(false)
+    default: return .other
+    }
+}
+
+@discardableResult
+func writeDefault(domain: String, key: String, value: Bool) -> Bool {
+    shell("/usr/bin/defaults", ["write", domain, key, "-bool", value ? "true" : "false"]).0 == 0
+}
+
+@discardableResult
+func deleteDefault(domain: String, key: String) -> Bool {
+    shell("/usr/bin/defaults", ["delete", domain, key]).0 == 0
+}
+
+struct EffectsOutcome: Equatable {
+    var changed = 0
+    var active = false
+    var failed: [String] = []
+}
+
+/// Reconcile the recorded state with the wanted one.
+///
+/// Reads and writes are injected so the decision table can be exercised without
+/// touching a real preference; production call sites keep the defaults.
+func reconcileVisualEffects(
+    catalog: [VisualEffectSetting],
+    reduce: Bool,
+    read: (VisualEffectSetting) -> DefaultState = { readDefault(domain: $0.domain, key: $0.key) },
+    write: (VisualEffectSetting, Bool) -> Bool = { writeDefault(domain: $0.domain, key: $0.key, value: $1) },
+    remove: (VisualEffectSetting) -> Bool = { deleteDefault(domain: $0.domain, key: $0.key) },
+    originals: inout [String: String]
+) -> EffectsOutcome {
+    var outcome = EffectsOutcome()
+    for setting in catalog {
+        let current = read(setting)
+        let original = originals[setting.id].map(decodeDefaultState)
+        switch effectChange(setting, current: current, reduce: reduce, original: original) {
+        case .leave:
+            // Handed back, or taken over by someone else: stop tracking it so a
+            // stale record cannot make the guard look active forever.
+            if !reduce, let original, current == original || current == .other {
+                originals.removeValue(forKey: setting.id)
+            }
+        case .write(let value):
+            if original == nil, let encoded = encodeDefaultState(current) {
+                originals[setting.id] = encoded
+            }
+            if write(setting, value) {
+                outcome.changed += 1
+            } else {
+                outcome.failed.append(setting.title)
+            }
+        case .restore(let value):
+            if write(setting, value) {
+                outcome.changed += 1
+                originals.removeValue(forKey: setting.id)
+            } else {
+                outcome.failed.append(setting.title)
+            }
+        case .restoreMissing:
+            if remove(setting) {
+                outcome.changed += 1
+                originals.removeValue(forKey: setting.id)
+            } else {
+                outcome.failed.append(setting.title)
+            }
+        }
+    }
+    outcome.active = reduce || !originals.isEmpty
+    return outcome
 }
 
 // MARK: - Design system
@@ -595,6 +1420,11 @@ struct RootView: View {
                     modeCard
                     fanCard
                     guardCard
+                    effectsCard
+                    audioCard
+                    codecCard
+                    chromeCard
+                    memoryCard
                     cpuCard
                     if !d.events.isEmpty { eventsCard }
                     footer
@@ -648,6 +1478,23 @@ struct RootView: View {
                 if d.mediaActive {
                     Chip(text: d.mediaGuard ? "Call shielded" : "Call active",
                          tint: .blue, active: true)
+                }
+                if d.codecSoftware {
+                    Chip(text: "Software decode", tint: .red, active: true)
+                } else if d.codecHardwareActive {
+                    Chip(text: "T2 offload", tint: .green, active: true)
+                }
+                if d.chromeGuard && d.chromeStatus == "background stopped" {
+                    Chip(text: "Chrome quiet", tint: .indigo, active: true)
+                }
+                if d.memoryPressure == "critical" {
+                    Chip(text: "RAM critical", tint: .red, active: true)
+                } else if d.memoryPressure == "high" {
+                    Chip(text: "RAM high", tint: .orange, active: true)
+                }
+                if d.autoTrim {
+                    Chip(text: d.autoTrimActive ? "Auto-trim on" : "Auto-trim (Auto)",
+                         tint: .purple, active: true)
                 }
                 Spacer(minLength: 0)
             }
@@ -769,6 +1616,190 @@ struct RootView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+            }
+        }
+        .cardSurface()
+    }
+
+    private var effectsCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            CardTitle(icon: "sparkles", text: "Animations & visual effects", trailing: d.effectsStatus)
+            Toggle("Reduce motion, blur and window animations",
+                   isOn: Binding(get: { d.effectsGuard }, set: { d.setEffectsGuard($0) }))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.system(size: 12, weight: .medium))
+
+            Text("On in every mode except Off. Switches off Reduce Motion, Reduce Transparency and automatic window animations — the compositing work the Intel Iris Plus would otherwise redraw every frame. Your original values are recorded and put back when this is turned off.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !d.effectsNote.isEmpty {
+                Text(d.effectsNote)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(d.effectsStatus == "partial" ? Color.orange : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .cardSurface()
+    }
+
+    private var audioCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            CardTitle(icon: "waveform", text: "Audio engine", trailing: d.audioState)
+            Toggle("Reset Core Audio when it spikes",
+                   isOn: Binding(get: { d.audioGuard }, set: { d.setAudioGuard($0) }))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.system(size: 12, weight: .medium))
+
+            Text("On in every mode except Off. If coreaudiod stays above 20 % CPU for two samples (about 4 s) — the signature of a stuck engine behind stuttering audio or video — it is asked to restart with SIGTERM and launchd brings it back in about a second. At most once every 10 minutes, three times an hour.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !d.audioNote.isEmpty {
+                Text(d.audioNote)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(d.audioState == "failed" ? Color.orange : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .cardSurface()
+    }
+
+    private var codecCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            CardTitle(icon: "film", text: "T2 video offload", trailing: d.codecStatus)
+            Toggle("Prefer hardware H.264/HEVC", isOn: Binding(get: { d.codecGuard }, set: { d.setCodecGuard($0) }))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.system(size: 12, weight: .medium))
+
+            HStack(spacing: 6) {
+                Chip(text: d.codecH264 ? "H.264 HW" : "H.264 SW",
+                     tint: d.codecH264 ? .green : .orange, active: true)
+                Chip(text: d.codecHEVC ? "HEVC HW" : "HEVC SW",
+                     tint: d.codecHEVC ? .green : .orange, active: true)
+                Chip(text: d.codecH264ify ? "h264ify installed" : "h264ify missing",
+                     tint: d.codecH264ify ? .green : .secondary, active: d.codecH264ify)
+                Spacer(minLength: 0)
+            }
+
+            Text("Checks VideoToolbox directly, so it works on every Mac model. H.264 and HEVC are decoded/encoded by the T2 on Intel Macs that have one. Runs in every mode except Off.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if d.codecOfferH264ify {
+                Button {
+                    d.openH264ify()
+                } label: {
+                    Text("Get h264ify…").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            if !d.codecNote.isEmpty {
+                Text(d.codecNote)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(d.codecSoftware ? Color.orange : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .cardSurface()
+    }
+
+    private var chromeCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            CardTitle(icon: "globe", text: "Chrome background", trailing: d.chromeStatus)
+            Toggle("Stop Chrome when it is not in use",
+                   isOn: Binding(get: { d.chromeGuard }, set: { d.setChromeGuard($0) }))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.system(size: 12, weight: .medium))
+
+            Text("When Chrome has no window, is not frontmost and is not playing audio/video, it is asked to quit. Its background mode is switched off, Google updater/Keystone agents are disabled, and leftover Chrome helpers are stopped. Restored when Chrome is used or this toggle is off.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !d.chromeNote.isEmpty {
+                Text(d.chromeNote)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .cardSurface()
+    }
+
+    private var memoryCard: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            CardTitle(icon: "memorychip", text: "Memory", trailing: d.memoryStatus)
+
+            HStack(spacing: 10) {
+                Chip(text: String(format: "Free %.0f%%", d.memoryFree),
+                     tint: d.memoryPressure == "normal" ? .green : (d.memoryPressure == "high" ? .orange : .red),
+                     active: true)
+                Chip(text: "Swap \(d.memorySwap)", tint: .secondary, active: false)
+                Chip(text: "Compressed \(d.memoryCompressed)", tint: .secondary, active: false)
+                Chip(text: String(format: "Reclaimable %.1f GB", d.memoryReclaimable / 1024), tint: .secondary, active: false)
+                Spacer(minLength: 0)
+            }
+
+            Toggle("Quit idle apps under memory pressure",
+                   isOn: Binding(get: { d.memoryGuard }, set: { d.setMemoryGuard($0) }))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.system(size: 12, weight: .medium))
+
+            Toggle("Reclaim cache when the kernel runs out",
+                   isOn: Binding(get: { d.memoryReclaim }, set: { d.setMemoryReclaim($0) }))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.system(size: 12, weight: .medium))
+
+            Text("Runs in every mode except Off. Under high pressure, apps with no window that have been idle for 10+ minutes are asked to quit gracefully (5 minutes at critical pressure). Apps can refuse; nothing is force-killed and no purge is run.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !d.memoryTop.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(d.memoryTop.enumerated()), id: \.offset) { _, row in
+                        let name = row["name"] as? String ?? "?"
+                        let mb = row["mb"] as? Double ?? 0
+                        HStack(spacing: 6) {
+                            Text(name)
+                                .font(.system(size: 10.5))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 6)
+                            Text(String(format: "%.0f MB", mb))
+                                .font(.system(size: 10, weight: .medium))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(.top, 1)
+            }
+
+            if !d.memoryReclaimNote.isEmpty {
+                Text(d.memoryReclaimNote)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !d.memoryNote.isEmpty {
+                Text(d.memoryNote)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .cardSurface()
@@ -955,6 +1986,26 @@ struct MacOSSheet: View {
             Divider()
             ScrollView {
                 VStack(spacing: 6) {
+                    ToggleRow(
+                        title: "Auto-trim safe background services",
+                        subtitle: "Only in Auto mode. Curated background-only Apple jobs; restored when you leave Auto or switch this off.",
+                        isOn: d.autoTrim
+                    ) { d.setAutoTrim($0) }
+
+                    if !d.autoTrimNote.isEmpty {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "wand.and.stars")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Color.purple)
+                            Text(d.autoTrimNote)
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(10)
+                        .background(Color.purple.opacity(0.08), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    }
+
                     if !d.macosNote.isEmpty {
                         HStack(alignment: .top, spacing: 6) {
                             Image(systemName: "info.circle")
@@ -971,8 +2022,11 @@ struct MacOSSheet: View {
                     ForEach(Array(d.macosItems.enumerated()), id: \.offset) { _, it in
                         let id = it["id"] as? String ?? "?"
                         let enabled = it["enabled"] as? Bool ?? false
+                        let trimmed = it["auto_trimmed"] as? Bool ?? false
+                        let autoSafe = it["auto_safe"] as? Bool ?? false
+                        let suffix = trimmed ? " · auto-trimmed" : (autoSafe ? " · auto-safe" : "")
                         ToggleRow(title: id,
-                                  subtitle: it["desc"] as? String ?? "",
+                                  subtitle: (it["desc"] as? String ?? "") + suffix,
                                   isOn: enabled) { on in
                             if on {
                                 d.setMacOS(id, enable: true)
@@ -1067,11 +2121,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var offerFix = false
     var accelPending: Set<String> = []
     var accelNote = ""
+    var chromeGuardPauseUntil: Date?
+    var chromeQuitAskedAt: Date?
+    var chromeQuitRefusedUntil: Date?
+
+    // Chrome background guard
+    @Published var chromeGuard = true
+    @Published var chromeStatus = "watching"
+    @Published var chromeNote = ""
+
+    // Graceful memory guard
+    @Published var memoryGuard = true
+    @Published var memoryPressure = "normal"
+    @Published var memoryFree = 0.0
+    @Published var memorySwap = "—"
+    @Published var memoryCompressed = "—"
+    @Published var memoryStatus = "watching"
+    @Published var memoryNote = ""
+    @Published var memoryTop: [[String: Any]] = []
+    @Published var memoryReclaim = true
+    @Published var memoryReclaimNote = ""
+    @Published var memoryReclaims = 0
+    @Published var memoryReclaimable = 0.0
+    var lastMemoryScan: Date?
+    var lastChromeScan: Date?
+
+    // T2 / VideoToolbox codec guard
+    @Published var codecGuard = true
+    @Published var codecH264 = false
+    @Published var codecHEVC = false
+    @Published var codecStatus = "checking"
+    @Published var codecNote = ""
+    @Published var codecH264ify = false
+    @Published var codecH264ifyEnabled = false
+    @Published var codecOfferH264ify = false
+    @Published var codecSoftware = false
+    @Published var codecHardwareActive = false
+    var lastCodecScan: Date?
+
+    // Reduced visual effects: per-user defaults, written by this unprivileged
+    // process and tracked so they can always be handed back.
+    @Published var effectsGuard = true
+    @Published var effectsStatus = "reduced"
+    @Published var effectsNote = ""
+    var effectsOriginals: [String: String] = [:]
+    var lastEffectsScan: Date?
+
+    // Core Audio watchdog: the daemon owns the privilege and the decision; the
+    // UI only sends a boolean and renders the state it is told.
+    @Published var audioGuard = true
+    @Published var audioState = "watching"
+    @Published var audioNote = ""
+    @Published var audioRestarts = 0
 
     @Published var hint = ""
     @Published var software: [[String: Any]] = []
     @Published var macosItems: [[String: Any]] = []
     @Published var macosNote = ""
+    @Published var autoTrim = false
+    @Published var autoTrimActive = false
+    @Published var autoTrimNote = ""
 
     /// One accent colour for the whole window, derived from the thermal state
     /// so the UI reads at a glance: calm, warm, hot.
@@ -1108,6 +2217,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "chromeGuard") != nil {
+            chromeGuard = defaults.bool(forKey: "chromeGuard")
+        }
+        if defaults.object(forKey: "memoryGuard") != nil {
+            memoryGuard = defaults.bool(forKey: "memoryGuard")
+        }
+        if defaults.object(forKey: "codecGuard") != nil {
+            codecGuard = defaults.bool(forKey: "codecGuard")
+        }
+        if defaults.object(forKey: "effectsGuard") != nil {
+            effectsGuard = defaults.bool(forKey: "effectsGuard")
+        }
+        if let raw = defaults.dictionary(forKey: "visualEffectsOriginals") {
+            effectsOriginals = raw.compactMapValues { $0 as? String }
+        }
         buildStatusItem()
         buildWindow()
         refresh()
@@ -1258,6 +2383,285 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         refresh()
     }
 
+    /// Opt-in, daemon-side and Auto-only. The daemon owns the allowlist and
+    /// the restore bookkeeping; the UI only sends the boolean.
+    func setAutoTrim(_ on: Bool) {
+        autoTrim = on
+        if !on { autoTrimActive = false }
+        _ = sendRequest("{\"cmd\":\"auto_trim\",\"value\":\(on)}")
+        refresh()
+    }
+
+    func setChromeGuard(_ on: Bool) {
+        chromeGuard = on
+        UserDefaults.standard.set(on, forKey: "chromeGuard")
+        chromeNote = ""
+        refreshChromeGuard()
+    }
+
+    func setMemoryGuard(_ on: Bool) {
+        memoryGuard = on
+        UserDefaults.standard.set(on, forKey: "memoryGuard")
+        memoryNote = ""
+        refreshMemoryGuard()
+    }
+
+    /// OS-level cache reclaim: default on, every mode except Off. The daemon
+    /// enforces the cooldown and the hourly cap; the UI only sends a boolean.
+    func setMemoryReclaim(_ on: Bool) {
+        memoryReclaim = on
+        _ = sendRequest("{\"cmd\":\"memory_reclaim\",\"value\":\(on)}")
+        refresh()
+    }
+
+    func setCodecGuard(_ on: Bool) {
+        codecGuard = on
+        UserDefaults.standard.set(on, forKey: "codecGuard")
+        codecNote = ""
+        refreshCodecGuard()
+    }
+
+    /// Turning the guard off restores immediately rather than on the next tick.
+    func setEffectsGuard(_ on: Bool) {
+        effectsGuard = on
+        UserDefaults.standard.set(on, forKey: "effectsGuard")
+        effectsNote = ""
+        lastEffectsScan = nil
+        refreshVisualEffects()
+    }
+
+    /// Default on, every mode except Off. Nothing caller-supplied reaches the
+    /// signal: the daemon signals the compiled-in `coreaudiod` name only.
+    func setAudioGuard(_ on: Bool) {
+        audioGuard = on
+        _ = sendRequest("{\"cmd\":\"audio_guard\",\"value\":\(on)}")
+        refresh()
+    }
+
+    func openH264ify() {
+        if let url = URL(string: "https://chrome.google.com/webstore/detail/h264ify/aleakchihdccplidncghkekgioiakgal") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Chrome is only touched when it is genuinely idle. The quit request is
+    /// asynchronous: we ask once, then wait a few ticks before writing Chrome's
+    /// config, so Chrome cannot overwrite the change on its way out.
+    func refreshChromeGuard() {
+        if let pause = chromeGuardPauseUntil, pause > Date() {
+            chromeStatus = "paused"
+            return
+        }
+        let sample = cpuSample()
+        let s = chromeGuardState(sample: sample)
+        let managed = chromeBgManaged() || !chromeManagedAgents().isEmpty
+        switch chromeGuardAction(s, enabled: chromeGuard, managed: managed) {
+        case .nothing:
+            chromeStatus = chromeGuard ? (s.active ? "Chrome in use" : "watching") : "off"
+        case .restore:
+            var did = false
+            if !chromeManagedAgents().isEmpty, restoreGoogleAgents() { did = true }
+            // Leave Local State alone while Chrome is active; restore it when
+            // the guard is off or Chrome is closed.
+            if !chromeGuard || !s.running, restoreChromeBackground() { did = true }
+            chromeStatus = chromeGuard ? (s.active ? "Chrome in use" : "watching") : "off"
+            if did { chromeNote = "Restored Chrome's background setting and Google agents." }
+        case .trim:
+            if s.running {
+                if let refused = chromeQuitRefusedUntil, refused > Date() {
+                    chromeStatus = "Chrome refused to quit"
+                    return
+                }
+                if let asked = chromeQuitAskedAt {
+                    if Date().timeIntervalSince(asked) < 30 {
+                        chromeStatus = "quitting"
+                        return
+                    }
+                    chromeQuitAskedAt = nil
+                    chromeQuitRefusedUntil = Date().addingTimeInterval(1800)
+                    chromeStatus = "Chrome did not quit"
+                    chromeNote = "Chrome is idle but did not quit within 30 s; left alone for 30 minutes."
+                    return
+                }
+                chromeQuitAskedAt = Date()
+                for app in NSRunningApplication.runningApplications(withBundleIdentifier: chromeBundleID) {
+                    app.terminate()
+                }
+                chromeStatus = "quitting"
+                chromeNote = "Chrome is idle; asked it to quit gracefully."
+                return
+            }
+
+            chromeQuitAskedAt = nil
+            var did = false
+            let bg = chromeBackgroundMode()
+            if bg.readable && bg.enabled != false, disableChromeBackground() { did = true }
+            let managedAgents = Set(chromeManagedAgents())
+            if !googleBackgroundAgents.allSatisfy({ managedAgents.contains($0) }) {
+                if !disableGoogleAgents().isEmpty { did = true }
+            }
+            if !s.helperPids.isEmpty {
+                let stopped = stopChromeHelpers()
+                if stopped > 0 {
+                    chromeNote = "Stopped \(stopped) leftover Chrome helper(s)."
+                    did = true
+                }
+            }
+            chromeStatus = "background stopped"
+            if did && chromeNote.isEmpty {
+                chromeNote = "Chrome background mode off; Google agents disabled."
+            }
+        }
+    }
+
+    func refreshMemoryGuard() {
+        let stats = memoryStats()
+        memoryFree = stats.freePercent
+        memorySwap = stats.swapTotalMB > 0
+            ? String(format: "%.0f/%.0f MB", stats.swapUsedMB, stats.swapTotalMB)
+            : "—"
+        memoryCompressed = stats.totalMB > 0
+            ? String(format: "%.1f GB", stats.compressedMB / 1024.0)
+            : "—"
+        memoryPressure = stats.pressure.rawValue
+        memoryTop = topMemoryApps(3)
+
+        guard memoryGuard else { memoryStatus = "off"; return }
+        guard stats.readable else { memoryStatus = "unreadable"; return }
+        guard mode != "off" else { memoryStatus = "off (mode)"; return }
+
+        let now = Date()
+        let nowEpoch = now.timeIntervalSince1970
+        let apps = memoryAppStates(sample: cpuSample())
+        var last = doubleMap("memoryLastActive")
+        var refused = doubleMap("memoryRefused")
+        refused = refused.filter { $0.value > nowEpoch }
+        saveDoubleMap("memoryRefused", refused)
+
+        for app in apps {
+            if app.frontmost || app.hasWindow || app.audio || app.media || app.cpu >= 3.0 {
+                last[app.bundleID] = nowEpoch
+            } else if last[app.bundleID] == nil {
+                last[app.bundleID] = nowEpoch
+            }
+        }
+        let live = Set(apps.map { $0.bundleID })
+        last = last.filter { live.contains($0.key) }
+        saveDoubleMap("memoryLastActive", last)
+
+        guard stats.pressure != .normal else {
+            memoryStatus = "normal"
+            return
+        }
+
+        let candidates = apps.compactMap { app -> (MemoryAppState, Double)? in
+            let idle = nowEpoch - (last[app.bundleID] ?? nowEpoch)
+            let isRefused = (refused[app.bundleID] ?? 0) > nowEpoch
+            let ok = shouldQuitIdleApp(
+                app,
+                pressure: stats.pressure,
+                enabled: true,
+                idleFor: idle,
+                refused: isRefused
+            )
+            return ok ? (app, idle) : nil
+        }.sorted { $0.1 > $1.1 }
+
+        guard let (victim, idle) = candidates.first else {
+            memoryStatus = stats.pressure == .critical ? "critical · no idle apps" : "high · no idle apps"
+            return
+        }
+        guard let running = NSRunningApplication(processIdentifier: victim.pid) else { return }
+        if running.terminate() {
+            memoryStatus = "asked \(victim.name) to quit"
+            memoryNote = "Graceful quit requested for \(victim.name) after \(Int(idle / 60)) min idle; it can refuse or ask you to save."
+        } else {
+            memoryStatus = "\(victim.name) refused to quit"
+            memoryNote = "Left \(victim.name) alone for 30 minutes."
+        }
+        // Never nag: either it is shutting down or it refused. Re-evaluate in 30 minutes.
+        refused[victim.bundleID] = nowEpoch + 1800
+        saveDoubleMap("memoryRefused", refused)
+    }
+
+    func refreshCodecGuard() {
+        let sample = cpuSample()
+        let pulse = mediaPulse(sample: sample)
+        let hw = codecHardwareSupport()
+        codecH264 = hw.h264Decode && hw.h264Encode
+        codecHEVC = hw.hevcDecode && hw.hevcEncode
+
+        let hardwareActive = cpuFor("VTDecoderXPCService", in: sample) >= VIDEO_DECODE_CPU
+            || cpuFor("VTEncoderXPCService", in: sample) >= VIDEO_DECODE_CPU
+            || cpuFor("AVConference", in: sample) >= VIDEO_DECODE_CPU
+            || acceleratedApps.contains { cpuFor($0.gpuHelperTag, in: sample) >= APP_IN_USE_CPU }
+
+        let verdict = codecVerdict(
+            h264: hw.h264Decode,
+            hevc: hw.hevcDecode,
+            videoActive: pulse.video,
+            hardwareActive: hardwareActive
+        )
+        let ext = h264ifyStatusAll()
+        codecH264ify = ext.installed
+        codecH264ifyEnabled = ext.enabled
+        codecSoftware = verdict == .softwareDecode
+        codecHardwareActive = verdict == .hardwareOffload
+
+        guard codecGuard else { codecStatus = "off"; return }
+        guard mode != "off" else { codecStatus = "off (mode)"; return }
+
+        switch verdict {
+        case .unavailable:
+            codecStatus = "no H.264 hardware decode"
+            codecNote = "VideoToolbox reports no hardware H.264 decoder on this Mac."
+        case .ready:
+            codecStatus = "ready"
+            codecNote = hw.hevcDecode
+                ? "H.264 and HEVC hardware decode are available."
+                : "H.264 hardware decode is available."
+        case .hardwareOffload:
+            codecStatus = "T2 offload active"
+            codecNote = "VideoToolbox is doing the decode/encode work in hardware."
+        case .softwareDecode:
+            codecStatus = "software decode"
+            if ext.installed && ext.enabled {
+                codecNote = "h264ify is installed and enabled; this site may still be serving a codec the T2 cannot decode. Try reloading the video."
+            } else if ext.installed {
+                codecNote = "h264ify is installed but not enabled for this profile. Enable it to force H.264."
+            } else {
+                codecNote = "This site is using a codec the T2 cannot decode in hardware. h264ify makes sites serve H.264 instead."
+            }
+            codecOfferH264ify = !ext.installed
+        }
+    }
+
+    /// Keeps the reduced-effects profile in step with the cooling mode. A steady
+    /// state costs three reads and no writes, so this is safe on a timer.
+    func refreshVisualEffects() {
+        let reduce = effectsDesired(enabled: effectsGuard, mode: mode)
+        var originals = effectsOriginals
+        let outcome = reconcileVisualEffects(catalog: visualEffectCatalog, reduce: reduce, originals: &originals)
+        if originals != effectsOriginals {
+            effectsOriginals = originals
+            UserDefaults.standard.set(originals, forKey: "visualEffectsOriginals")
+        }
+        if !outcome.failed.isEmpty {
+            effectsStatus = "partial"
+            effectsNote = "Could not change \(outcome.failed.joined(separator: ", ")); everything else was left as it was."
+        } else if reduce {
+            effectsStatus = "reduced"
+            if outcome.changed > 0 {
+                effectsNote = "Motion, transparency and window animations are off to free GPU time. Applies as apps redraw; your original values are recorded."
+            }
+        } else {
+            effectsStatus = effectsGuard ? "off (mode)" : "off"
+            if outcome.changed > 0 {
+                effectsNote = "Your original motion, transparency and animation settings were put back."
+            }
+        }
+    }
+
     /// User override for the one case the guard must not take itself: a repair
     /// that needs the app restarted while a call or video is running.
     func fixAccelerationNow() {
@@ -1267,7 +2671,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             guard s.installed, !s.enabled else { continue }
             let (ok, msg) = enableAcceleration(app, relaunch: s.running)
             accelNote = msg
-            if ok { accelPending.remove(app.bundleID) }
+            if ok {
+                accelPending.remove(app.bundleID)
+                // Chrome may be restarting as part of the repair; give it time
+                // to come back before the background guard looks at it again.
+                if s.running { chromeGuardPauseUntil = Date().addingTimeInterval(30) }
+            }
         }
         refresh()
     }
@@ -1311,6 +2720,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 let (ok, msg) = enableAcceleration(app, relaunch: relaunch)
                 if ok {
                     accelPending.remove(app.bundleID)
+                    // A relaunch is a repair in progress, not an idle browser.
+                    if relaunch { chromeGuardPauseUntil = Date().addingTimeInterval(30) }
                     lines.append("Fixed: \(msg)")
                 } else {
                     lines.append("\(app.name): \(msg)")
@@ -1421,6 +2832,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     // MARK: refresh
 
+    /// Cadence-limited user-space guards. Each one is cheap enough to run on
+    /// demand from the UI, but not on every 2 s status tick.
+    func runUserSpaceGuards() {
+        let now = Date()
+        if lastChromeScan.map({ now.timeIntervalSince($0) >= 4 }) ?? true {
+            lastChromeScan = now
+            refreshChromeGuard()
+        }
+        if lastMemoryScan.map({ now.timeIntervalSince($0) >= 10 }) ?? true {
+            lastMemoryScan = now
+            refreshMemoryGuard()
+        }
+        if lastCodecScan.map({ now.timeIntervalSince($0) >= 5 }) ?? true {
+            lastCodecScan = now
+            refreshCodecGuard()
+        }
+        if lastEffectsScan.map({ now.timeIntervalSince($0) >= 10 }) ?? true {
+            lastEffectsScan = now
+            refreshVisualEffects()
+        }
+    }
+
     func refresh() {
         refreshAccelerationGuard()
         helperPresent = helperInstalled()
@@ -1431,6 +2864,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             statusItem?.button?.title = "—°"
             temp = nil
             fan = nil
+            // Chrome/memory/codec guards do not need the helper; keep them
+            // running so an uninstalled or stopped helper cannot silently
+            // re-enable Chrome background mode.
+            runUserSpaceGuards()
             return
         }
         helperRunning = true
@@ -1453,6 +2890,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         fanNote = s["fan_note"] as? String ?? ""
         if let m = s["mode"] as? String, m != mode { mode = m }
         if let f = s["fan_intent"] as? String, f != fanIntent { fanIntent = f }
+        autoTrim = s["auto_trim"] as? Bool ?? false
+        autoTrimActive = s["auto_trim_active"] as? Bool ?? false
+        autoTrimNote = s["auto_trim_note"] as? String ?? ""
+        if let a = s["audio_guard"] as? Bool { audioGuard = a }
+        audioState = s["audio_state"] as? String ?? "watching"
+        audioNote = s["audio_note"] as? String ?? ""
+        audioRestarts = s["audio_restarts"] as? Int ?? 0
+        if let r = s["memory_reclaim"] as? Bool { memoryReclaim = r }
+        memoryReclaimNote = s["memory_note"] as? String ?? ""
+        memoryReclaims = s["memory_reclaims"] as? Int ?? 0
+        memoryReclaimable = s["memory_reclaimable_mb"] as? Double ?? 0
+
+        // The three user-space guards are heavier than reading daemon status,
+        // so each runs on its own cadence. Chrome is checked often enough to
+        // notice that a graceful quit finished; memory and codec are slower.
+        runUserSpaceGuards()
 
         // A disappeared PID must not linger in the demoted set — it would put a
         // stale down-arrow next to an unrelated process that reused the pid.
@@ -1475,7 +2928,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 // this needs no live browser and no privileges: `ThermalGuard --self-test`.
 if CommandLine.arguments.contains("--self-test") {
     var failures = 0
+    var total = 0
     func expect(_ name: String, _ got: AccelAction, _ want: AccelAction) {
+        total += 1
+        if got != want {
+            failures += 1
+            print("FAIL \(name): got \(got), want \(want)")
+        } else {
+            print("ok   \(name)")
+        }
+    }
+    func expectEq<T: Equatable>(_ name: String, _ got: T, _ want: T) {
+        total += 1
         if got != want {
             failures += 1
             print("FAIL \(name): got \(got), want \(want)")
@@ -1515,7 +2979,133 @@ if CommandLine.arguments.contains("--self-test") {
     var running = off; running.running = true; running.usage = .idle
     expect("idle running app restarted", accelAction(running, pulse: quiet, pending: true), .enableNow(relaunch: true))
 
-    print(failures == 0 ? "PASS 8/8" : "FAILED \(failures)")
+    // ---- Chrome background guard policy ----
+    var chrome = ChromeGuardState()
+    chrome.installed = true
+    expectEq("chrome: idle is trimmed", chromeGuardAction(chrome, enabled: true, managed: false), .trim)
+    chrome.running = true
+    chrome.hasWindow = true
+    expectEq("chrome: window means in use", chromeGuardAction(chrome, enabled: true, managed: false), .nothing)
+    expectEq("chrome: window restores managed state", chromeGuardAction(chrome, enabled: true, managed: true), .restore)
+    chrome.hasWindow = false
+    chrome.frontmost = true
+    expectEq("chrome: frontmost means in use", chromeGuardAction(chrome, enabled: true, managed: false), .nothing)
+    chrome.frontmost = false
+    chrome.launching = true
+    expectEq("chrome: still launching means in use", chromeGuardAction(chrome, enabled: true, managed: false), .nothing)
+    chrome.launching = false
+    chrome.audio = true
+    expectEq("chrome: audio means in use", chromeGuardAction(chrome, enabled: true, managed: false), .nothing)
+    chrome.audio = false
+    chrome.media = true
+    expectEq("chrome: media means in use", chromeGuardAction(chrome, enabled: true, managed: false), .nothing)
+    chrome.media = false
+    expectEq("chrome: disabled restores managed state", chromeGuardAction(chrome, enabled: false, managed: true), .restore)
+    expectEq("chrome: disabled and unmanaged is a no-op", chromeGuardAction(chrome, enabled: false, managed: false), .nothing)
+    let missingChrome = ChromeGuardState()
+    expectEq("chrome: missing install restores", chromeGuardAction(missingChrome, enabled: true, managed: true), .restore)
+    expectEq("chrome: missing install is otherwise inert", chromeGuardAction(missingChrome, enabled: true, managed: false), .nothing)
+
+    expectEq("chrome helper: renderer path accepted", isChromeHelperPath("/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)"), true)
+    expectEq("chrome helper: crashpad accepted", isChromeHelperPath("/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/chrome_crashpad_handler"), true)
+    expectEq("chrome helper: main binary rejected", isChromeHelperPath(chromeMainExecutable), false)
+    expectEq("chrome helper: unrelated app rejected", isChromeHelperPath("/Applications/Other.app/Contents/MacOS/Helper"), false)
+
+    // ---- Memory guard policy ----
+    let mem = MemoryAppState(bundleID: "com.example.idle", name: "Idle", pid: 42)
+    expectEq("memory: normal pressure never quits", shouldQuitIdleApp(mem, pressure: .normal, enabled: true, idleFor: 99999, refused: false), false)
+    expectEq("memory: high pressure waits 10 min", shouldQuitIdleApp(mem, pressure: .high, enabled: true, idleFor: 599, refused: false), false)
+    expectEq("memory: high pressure acts after 10 min", shouldQuitIdleApp(mem, pressure: .high, enabled: true, idleFor: 600, refused: false), true)
+    expectEq("memory: critical waits 5 min", shouldQuitIdleApp(mem, pressure: .critical, enabled: true, idleFor: 299, refused: false), false)
+    expectEq("memory: critical acts after 5 min", shouldQuitIdleApp(mem, pressure: .critical, enabled: true, idleFor: 300, refused: false), true)
+    expectEq("memory: disabled is inert", shouldQuitIdleApp(mem, pressure: .critical, enabled: false, idleFor: 99999, refused: false), false)
+    expectEq("memory: a refusal is respected", shouldQuitIdleApp(mem, pressure: .critical, enabled: true, idleFor: 99999, refused: true), false)
+    var protected = mem; protected.protectedApp = true
+    expectEq("memory: protected apps are never quit", shouldQuitIdleApp(protected, pressure: .critical, enabled: true, idleFor: 99999, refused: false), false)
+    var windowed = mem; windowed.hasWindow = true
+    expectEq("memory: apps with windows are never quit", shouldQuitIdleApp(windowed, pressure: .critical, enabled: true, idleFor: 99999, refused: false), false)
+    var front = mem; front.frontmost = true
+    expectEq("memory: frontmost app is never quit", shouldQuitIdleApp(front, pressure: .critical, enabled: true, idleFor: 99999, refused: false), false)
+    var audio = mem; audio.audio = true
+    expectEq("memory: audio apps are never quit", shouldQuitIdleApp(audio, pressure: .critical, enabled: true, idleFor: 99999, refused: false), false)
+    var media = mem; media.media = true
+    expectEq("memory: camera users are never quit", shouldQuitIdleApp(media, pressure: .critical, enabled: true, idleFor: 99999, refused: false), false)
+    var busy = mem; busy.cpu = 3.0
+    expectEq("memory: busy apps are never quit", shouldQuitIdleApp(busy, pressure: .critical, enabled: true, idleFor: 99999, refused: false), false)
+
+    expectEq("memory: healthy machine is normal", memoryPressureLevel(freePercent: 50, swapUsedPercent: 0, compressedPercent: 0), .normal)
+    expectEq("memory: low free RAM is high", memoryPressureLevel(freePercent: 10, swapUsedPercent: 0, compressedPercent: 0), .high)
+    expectEq("memory: very low free RAM is critical", memoryPressureLevel(freePercent: 5, swapUsedPercent: 0, compressedPercent: 0), .critical)
+    expectEq("memory: full swap is critical", memoryPressureLevel(freePercent: 50, swapUsedPercent: 80, compressedPercent: 0), .critical)
+    expectEq("memory: heavy compression is critical", memoryPressureLevel(freePercent: 50, swapUsedPercent: 0, compressedPercent: 60), .critical)
+    expectEq("memory: unreadable pressure is critical", memoryPressureLevel(freePercent: .nan, swapUsedPercent: 0, compressedPercent: 0), .critical)
+
+    // ---- Reduced visual effects policy ----
+    expectEq("effects: on by default in Auto", effectsDesired(enabled: true, mode: "auto"), true)
+    expectEq("effects: follow a capped mode", effectsDesired(enabled: true, mode: "coolquiet"), true)
+    expectEq("effects: off when the toggle is off", effectsDesired(enabled: false, mode: "auto"), false)
+    expectEq("effects: Off mode hands everything back", effectsDesired(enabled: true, mode: "off"), false)
+
+    let motion = visualEffectCatalog[0]
+    expectEq("effects: missing key is written",
+             effectChange(motion, current: .missing, reduce: true, original: nil),
+             EffectChange.write(motion.reduced))
+    expectEq("effects: already reduced is left alone",
+             effectChange(motion, current: .flag(motion.reduced), reduce: true, original: nil),
+             EffectChange.leave)
+    expectEq("effects: opposite value is rewritten",
+             effectChange(motion, current: .flag(!motion.reduced), reduce: true, original: nil),
+             EffectChange.write(motion.reduced))
+    expectEq("effects: a foreign type is never overwritten",
+             effectChange(motion, current: .other, reduce: true, original: nil),
+             EffectChange.leave)
+    expectEq("effects: recorded boolean is restored",
+             effectChange(motion, current: .flag(motion.reduced), reduce: false, original: .flag(!motion.reduced)),
+             EffectChange.restore(!motion.reduced))
+    expectEq("effects: an unchanged key needs no restore",
+             effectChange(motion, current: .flag(!motion.reduced), reduce: false, original: .flag(!motion.reduced)),
+             EffectChange.leave)
+    expectEq("effects: an originally absent key is deleted again",
+             effectChange(motion, current: .flag(motion.reduced), reduce: false, original: .missing),
+             EffectChange.restoreMissing)
+    expectEq("effects: a foreign value is never restored over",
+             effectChange(motion, current: .other, reduce: false, original: .flag(false)),
+             EffectChange.leave)
+    expectEq("effects: nothing recorded means no restore",
+             effectChange(motion, current: .flag(true), reduce: false, original: nil),
+             EffectChange.leave)
+    expectEq("effects: catalog ids are unique",
+             Set(visualEffectCatalog.map { $0.id }).count, visualEffectCatalog.count)
+    expectEq("effects: every catalog entry names a domain, key and title",
+             visualEffectCatalog.allSatisfy { !$0.domain.isEmpty && !$0.key.isEmpty && !$0.title.isEmpty },
+             true)
+
+    // End to end over the real defaults store, against a scratch domain so no
+    // actual preference is touched: apply, read back, restore, forget.
+    let scratch = "com.thermalguard.selftest.\(getpid())"
+    let probe = VisualEffectSetting(id: "probe", domain: scratch, key: "probe",
+                                    title: "Probe", reduced: true)
+    var recorded: [String: String] = [:]
+    let applied = reconcileVisualEffects(catalog: [probe], reduce: true, originals: &recorded)
+    expectEq("effects: apply writes the reduced value", applied.changed, 1)
+    expectEq("effects: applied value reads back", readDefault(domain: scratch, key: "probe"), .flag(true))
+    expectEq("effects: absent key is remembered as absent", recorded["probe"], "missing")
+    let steady = reconcileVisualEffects(catalog: [probe], reduce: true, originals: &recorded)
+    expectEq("effects: a steady state writes nothing", steady.changed, 0)
+    let restored = reconcileVisualEffects(catalog: [probe], reduce: false, originals: &recorded)
+    expectEq("effects: restore changes it back", restored.changed, 1)
+    expectEq("effects: restored key is absent again", readDefault(domain: scratch, key: "probe"), .missing)
+    expectEq("effects: restore forgets its record", recorded.isEmpty, true)
+    _ = shell("/usr/bin/defaults", ["delete", scratch])
+
+    // ---- T2 / VideoToolbox codec policy ----
+    expectEq("codec: no H.264 decoder is unavailable", codecVerdict(h264: false, hevc: true, videoActive: false, hardwareActive: true), CodecVerdict.unavailable)
+    expectEq("codec: idle with H.264 is ready", codecVerdict(h264: true, hevc: true, videoActive: false, hardwareActive: false), CodecVerdict.ready(h264: true, hevc: true))
+    expectEq("codec: idle H.264 only is ready", codecVerdict(h264: true, hevc: false, videoActive: false, hardwareActive: false), CodecVerdict.ready(h264: true, hevc: false))
+    expectEq("codec: active hardware work is offload", codecVerdict(h264: true, hevc: true, videoActive: true, hardwareActive: true), CodecVerdict.hardwareOffload)
+    expectEq("codec: active without hardware work is software", codecVerdict(h264: true, hevc: true, videoActive: true, hardwareActive: false), CodecVerdict.softwareDecode)
+
+    print(failures == 0 ? "PASS \(total)/\(total)" : "FAILED \(failures)/\(total)")
     exit(failures == 0 ? 0 : 1)
 }
 
@@ -1557,6 +3147,72 @@ if CommandLine.arguments.contains("--chrome-fix-legacy") {
     let (ok, msg) = enableAcceleration(acceleratedApps[0], relaunch: false)
     print(msg)
     exit(ok ? 0 : 1)
+}
+if CommandLine.arguments.contains("--chrome-check") {
+    let s = chromeGuardState(sample: cpuSample())
+    let managed = chromeBgManaged() || !chromeManagedAgents().isEmpty
+    let action: String
+    switch chromeGuardAction(s, enabled: true, managed: managed) {
+    case .nothing: action = "nothing"
+    case .trim: action = "trim"
+    case .restore: action = "restore"
+    }
+    print("{\"installed\":\(s.installed),\"running\":\(s.running),\"active\":\(s.active),\"has_window\":\(s.hasWindow),\"audio\":\(s.audio),\"media\":\(s.media),\"bg_readable\":\(s.bgReadable),\"bg_enabled\":\(s.bgEnabled.map { $0 ? "true" : "false" } ?? "null"),\"helpers\":\(s.helperPids.count),\"managed\":\(managed),\"action\":\"\(action)\"}")
+    exit(0)
+}
+if CommandLine.arguments.contains("--memory-check") {
+    let stats = memoryStats()
+    let apps = memoryAppStates(sample: cpuSample())
+    let protected = apps.filter { $0.protectedApp }.count
+    let idle = apps.filter { !$0.protectedApp && !$0.hasWindow && !$0.frontmost && !$0.audio && !$0.media && $0.cpu < 3.0 }.count
+    print("{\"readable\":\(stats.readable),\"free_percent\":\(Int(stats.freePercent)),\"swap_used_mb\":\(Int(stats.swapUsedMB)),\"swap_total_mb\":\(Int(stats.swapTotalMB)),\"compressed_mb\":\(Int(stats.compressedMB)),\"pressure\":\"\(stats.pressure.rawValue)\",\"apps\":\(apps.count),\"protected\":\(protected),\"idle_candidates\":\(idle)}")
+    exit(0)
+}
+if CommandLine.arguments.contains("--effects-check") {
+    let q = String(UnicodeScalar(34))
+    var rows: [String] = []
+    var reduced = 0
+    for setting in visualEffectCatalog {
+        let state = readDefault(domain: setting.domain, key: setting.key)
+        let value: String
+        switch state {
+        case .missing: value = "null"
+        case .flag(let on): value = on ? "true" : "false"
+        case .other: value = "other"
+        }
+        if state == .flag(setting.reduced) { reduced += 1 }
+        rows.append("{" + q + "id" + q + ":" + q + setting.id + q
+                    + "," + q + "domain" + q + ":" + q + setting.domain + q
+                    + "," + q + "key" + q + ":" + q + setting.key + q
+                    + "," + q + "value" + q + ":" + value
+                    + "," + q + "reduced" + q + ":" + (setting.reduced ? "true" : "false") + "}")
+    }
+    let settings = rows.joined(separator: ",")
+    print("{" + q + "reduced" + q + ":" + String(reduced)
+          + "," + q + "total" + q + ":" + String(visualEffectCatalog.count)
+          + "," + q + "settings" + q + ":[" + settings + "]}")
+    exit(0)
+}
+
+if CommandLine.arguments.contains("--codec-check") {
+    let hw = codecHardwareSupport()
+    let sample = cpuSample()
+    let pulse = mediaPulse(sample: sample)
+    let hardwareActive = cpuFor("VTDecoderXPCService", in: sample) >= VIDEO_DECODE_CPU
+        || cpuFor("VTEncoderXPCService", in: sample) >= VIDEO_DECODE_CPU
+        || cpuFor("AVConference", in: sample) >= VIDEO_DECODE_CPU
+        || acceleratedApps.contains { cpuFor($0.gpuHelperTag, in: sample) >= APP_IN_USE_CPU }
+    let verdict = codecVerdict(h264: hw.h264Decode, hevc: hw.hevcDecode, videoActive: pulse.video, hardwareActive: hardwareActive)
+    let label: String
+    switch verdict {
+    case .unavailable: label = "unavailable"
+    case .ready: label = "ready"
+    case .hardwareOffload: label = "hardware"
+    case .softwareDecode: label = "software"
+    }
+    let ext = h264ifyStatusAll()
+    print("{\"h264_decode\":\(hw.h264Decode),\"h264_encode\":\(hw.h264Encode),\"hevc_decode\":\(hw.hevcDecode),\"hevc_encode\":\(hw.hevcEncode),\"video\":\(pulse.video),\"verdict\":\"\(label)\",\"h264ify_installed\":\(ext.installed),\"h264ify_enabled\":\(ext.enabled)}")
+    exit(0)
 }
 let app = NSApplication.shared
 let delegate = AppDelegate()
