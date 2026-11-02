@@ -19,13 +19,18 @@ struct Guard {
     child: Child,
     sock: PathBuf,
     dir: PathBuf,
+    /// Keep the run directory across `drop`, so a restart test can reuse the
+    /// state file the daemon left behind.
+    preserve: bool,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.preserve {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -72,7 +77,12 @@ fn start_in(dir: PathBuf, envs: &[(&str, String)]) -> Guard {
     }
     let child = cmd.spawn().expect("daemon should start");
 
-    let guard = Guard { child, sock, dir };
+    let guard = Guard {
+        child,
+        sock,
+        dir,
+        preserve: false,
+    };
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
         if guard.sock.exists() && UnixStream::connect(&guard.sock).is_ok() {
@@ -195,6 +205,7 @@ fn status_returns_the_full_ui_contract() {
         "\"fan_note\"",
         "\"fan_target\"",
         "\"fan_intent\"",
+        "\"battery_hot\"",
     ] {
         assert!(reply.contains(key), "missing {} in {}", key, reply);
     }
@@ -736,5 +747,194 @@ fn tampered_tracked_ids_cannot_touch_non_auto_safe_services() {
         "tampered ids were restored/tracked: {}",
         r
     );
+}
+
+// ---- power-cap integration tests ------------------------------------------
+
+/// A fake `pmset` that keeps `lowpowermode` in a file, so the cap on/off path
+/// can be exercised end to end without touching the real machine.
+struct FakePmset {
+    dir: PathBuf,
+    script: PathBuf,
+    state: PathBuf,
+    /// Every argv the daemon passed, one line per call.
+    log: PathBuf,
+}
+
+impl Drop for FakePmset {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn fake_pmset() -> FakePmset {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_dir("tg-fake-pmset");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("pmset");
+    let state = dir.join("lowpowermode");
+    // The script appends its argv to "<state>.log".
+    let log = dir.join("lowpowermode.log");
+    let body = r#"#!/bin/sh
+set -eu
+state="${FAKE_PMSET_STATE:?}"
+echo "$*" >> "${FAKE_PMSET_STATE:?}.log"
+v=0
+if [ -f "$state" ]; then v=$(cat "$state"); fi
+case "$1:$2" in
+  -g:custom)
+    printf 'AC Power:\n sleep 1\n lowpowermode %s\nBattery Power:\n sleep 1\n lowpowermode %s\n' "$v" "$v"
+    ;;
+  -a:lowpowermode)
+    echo "$3" > "$state"
+    ;;
+  -g:therm)
+    echo 'CPU_Speed_Limit              = 100'
+    ;;
+  -g:batt)
+    echo "Now drawing from 'AC Power'"
+    ;;
+  *) ;;
+esac
+exit 0
+"#;
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    FakePmset {
+        dir,
+        script,
+        state,
+        log,
+    }
+}
+
+fn fake_pmset_env(f: &FakePmset) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "THERMALGUARD_PMSET",
+            f.script.to_string_lossy().into_owned(),
+        ),
+        ("FAKE_PMSET_STATE", f.state.to_string_lossy().into_owned()),
+    ]
+}
+
+fn pmset_state(f: &FakePmset) -> String {
+    std::fs::read_to_string(&f.state)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn cap_on(g: &Guard) -> bool {
+    ask(g, "{\"cmd\":\"status\"}").contains("\"cap_active\":true")
+}
+
+#[test]
+fn power_cap_turns_on_with_a_cooling_mode_and_off_again() {
+    let fake = fake_pmset();
+    let g = start_with_env(&fake_pmset_env(&fake));
+    assert!(!cap_on(&g), "the daemon must not cap on its own at startup");
+
+    let _ = ask(&g, "{\"cmd\":\"mode\",\"value\":\"maxcool\"}");
+    assert!(
+        wait_until(12, || cap_on(&g)),
+        "Max Cool never engaged the power cap"
+    );
+    assert_eq!(pmset_state(&fake), "1", "the cap was not applied to macOS");
+
+    // Held, not toggled: with the fake pmset in front of us the cap must stay
+    // on across several control-loop ticks.
+    for _ in 0..4 {
+        assert!(cap_on(&g), "the cap dropped out while Max Cool was selected");
+        std::thread::sleep(Duration::from_millis(700));
+    }
+
+    let _ = ask(&g, "{\"cmd\":\"mode\",\"value\":\"off\"}");
+    assert!(
+        wait_until(12, || !cap_on(&g)),
+        "Off never released the power cap"
+    );
+    assert_eq!(pmset_state(&fake), "0", "macOS was left capped after Off");
+
+    // One change per transition: no off/on/off flapping in the argv log.
+    let calls = std::fs::read_to_string(&fake.log).unwrap_or_default();
+    let writes = calls
+        .lines()
+        .filter(|l| l.starts_with("-a lowpowermode"))
+        .count();
+    assert_eq!(writes, 2, "expected exactly one on and one off, got {:?}", calls);
+}
+
+#[test]
+fn power_cap_state_survives_a_restart_and_is_released_by_off() {
+    let fake = fake_pmset();
+    let dir = unique_dir("tg-cap-restart");
+    std::fs::create_dir_all(&dir).unwrap();
+    let envs = fake_pmset_env(&fake);
+
+    let mut first = start_in(dir.clone(), &envs);
+    let _ = ask(&first, "{\"cmd\":\"mode\",\"value\":\"maxcool\"}");
+    assert!(wait_until(12, || cap_on(&first)), "cap never engaged");
+    assert_eq!(pmset_state(&fake), "1");
+    first.preserve = true;
+    drop(first);
+
+    // A restart must not forget that the machine is still capped: reporting
+    // "off" while macOS is capped is what used to leave the cap stuck on.
+    let second = start_in(dir.clone(), &envs);
+    let r = ask(&second, "{\"cmd\":\"status\"}");
+    assert!(
+        r.contains("\"cap_active\":true"),
+        "restored cap not reported: {}",
+        r
+    );
+    assert!(
+        r.contains("\"mode\":\"maxcool\""),
+        "restored mode missing: {}",
+        r
+    );
+
+    let _ = ask(&second, "{\"cmd\":\"mode\",\"value\":\"off\"}");
+    assert!(
+        wait_until(12, || !cap_on(&second)),
+        "Off after a restart did not release the cap"
+    );
+    assert_eq!(pmset_state(&fake), "0");
+}
+
+#[test]
+fn fan_preference_defaults_to_silent() {
+    let g = start();
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(
+        r.contains("\"fan_intent\":\"quiet\""),
+        "the default fan preference must be silent: {}",
+        r
+    );
+    // And it must stay silent across a restart, not silently revert.
+    let _ = ask(&g, "{\"cmd\":\"fan\",\"value\":\"auto\"}");
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"fan_intent\":\"auto\""), "got {}", r);
+}
+
+#[test]
+fn process_sample_does_not_flicker_between_ticks() {
+    // Regression: `ps` runs every 4 s, but the ticks in between used an empty
+    // sample, so the process list, media shield and demotion state blinked off
+    // every other tick.
+    let g = start();
+    assert!(
+        wait_until(10, || !ask(&g, "{\"cmd\":\"status\"}").contains("\"procs\":[]")),
+        "the daemon never sampled processes"
+    );
+    for _ in 0..8 {
+        let r = ask(&g, "{\"cmd\":\"status\"}");
+        assert!(
+            !r.contains("\"procs\":[]"),
+            "process list dropped back to empty: {}",
+            r
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 

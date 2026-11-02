@@ -5,6 +5,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="$ROOT/build"
 APP="$BUILD/ThermalGuard.app"
+# Keep the build tree out of Spotlight. A second copy of the app here must
+# never appear in search results, where it could be launched from the project
+# folder instead of the installed copy in /Applications.
+mkdir -p "$BUILD"
+: > "$BUILD/.metadata_never_index"
 export PATH="$HOME/.cargo/bin:$PATH"
 
 echo "==> 1/6 Rust daemon (release, x86_64-apple-darwin)"

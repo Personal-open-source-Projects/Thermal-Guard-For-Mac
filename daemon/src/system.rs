@@ -5,7 +5,6 @@
 
 use std::os::raw::{c_char, c_int, c_void};
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 const PMSET: &str = "/usr/bin/pmset";
 const SYSCTL: &str = "/usr/sbin/sysctl";
@@ -44,6 +43,18 @@ pub fn console_user() -> String {
     user
 }
 
+/// `/usr/bin/pmset` in production; the override exists only for the test
+/// suite and is refused whenever the process is root, so an installed daemon
+/// can never be steered at an arbitrary binary.
+fn pmset_path() -> String {
+    if crate::overrides_allowed() {
+        if let Ok(v) = std::env::var("THERMALGUARD_PMSET") {
+            return v;
+        }
+    }
+    PMSET.to_string()
+}
+
 /// macOS' own supported power cap. On Intel this drops the ceiling from the
 /// turbo ratio (35 x 100 MHz = 3.5 GHz) to the low-power ratio (24 x 100 MHz),
 /// which is what actually removes the sustained heat burst.
@@ -53,7 +64,7 @@ pub fn set_low_power_mode(on: bool) -> Result<(), String> {
             return Ok(());
         }
     }
-    let out = Command::new(PMSET)
+    let out = Command::new(pmset_path())
         .args(["-a", "lowpowermode", if on { "1" } else { "0" }])
         .output()
         .map_err(|e| e.to_string())?;
@@ -64,39 +75,8 @@ pub fn set_low_power_mode(on: bool) -> Result<(), String> {
     }
 }
 
-/// Cached low power mode state. The pmset custom output changes infrequently,
-/// so caching avoids a process spawn on every state check.
-pub struct LowPowerCache {
-    state: Option<bool>,
-    until: Instant,
-}
-
-impl LowPowerCache {
-    pub fn new() -> Self {
-        Self { state: None, until: Instant::now() }
-    }
-
-    /// Returns the cached state if fresh, otherwise reads from pmset and caches.
-    pub fn get(&mut self, sock: &str) -> Option<bool> {
-        if let Some(state) = self.state.clone() {
-            if Instant::now() < self.until {
-                return Some(state);
-            }
-        }
-        self.state = low_power_mode();
-        self.until = Instant::now() + Duration::from_secs(6);
-        self.state.as_ref().copied()
-    }
-
-    /// Invalidate the cache after a state change.
-    pub fn invalidate(&mut self) {
-        self.state = None;
-        self.until = Instant::now();
-    }
-}
-
 pub fn low_power_mode() -> Option<bool> {
-    let text = run(PMSET, &["-g", "custom"])?;
+    let text = run(&pmset_path(), &["-g", "custom"])?;
     let mut in_ac = false;
     for line in text.lines() {
         let t = line.trim();
@@ -114,7 +94,7 @@ pub fn low_power_mode() -> Option<bool> {
 /// `CPU_Speed_Limit` from the thermal monitor: 100 = unthrottled, below that
 /// macOS is actively starving the CPU because of heat.
 pub fn cpu_speed_limit() -> Option<u32> {
-    let text = run(PMSET, &["-g", "therm"])?;
+    let text = run(&pmset_path(), &["-g", "therm"])?;
     for line in text.lines() {
         let t = line.trim();
         if let Some(v) = t.strip_prefix("CPU_Speed_Limit") {
@@ -164,15 +144,6 @@ pub fn battery_temp() -> Option<f64> {
     None
 }
 
-/// Check if the battery is running hot. Battery/VRM heat stacks on SoC heat
-/// when charging, making the chassis harder to cool.
-/// Returns true when the battery temperature is elevated enough to warrant
-/// earlier power capping.
-pub fn battery_is_hot(temp_c: Option<f64>) -> bool {
-    // Battery above 45°C is considered hot; at this point the VRM and battery
-    // chemistry add meaningful heat to the chassis.
-    temp_c.map_or(false, |t| t >= 45.0)
-}
 
 pub fn on_ac_power() -> bool {
     run(PMSET, &["-g", "batt"])

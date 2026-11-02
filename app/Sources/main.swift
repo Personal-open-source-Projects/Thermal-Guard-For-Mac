@@ -86,6 +86,12 @@ func shell(_ path: String, _ args: [String]) -> (Int32, String) {
 }
 
 func helperInstalled() -> Bool {
+    // The daemon answering its own socket is the only proof that matters, and
+    // it is what keeps the app from showing an admin-password install prompt
+    // again: launchd loads the helper at boot from /Library/LaunchDaemons.
+    if let reply = sendRequest("{\"cmd\":\"status\"}"), reply.contains("\"mode\"") {
+        return true
+    }
     let out = shell("/bin/launchctl", ["print", "system/\(HELPER_LABEL)"]).1
     return !out.contains("Could not find service")
 }
@@ -2156,6 +2162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var turbo: Int?
     @Published var lpm: Int?
     @Published var capActive = false
+    @Published var batteryHot = false
     @Published var mode = "auto"
     @Published var modeLabel = "Auto"
     @Published var fanIntent = "auto"
@@ -2278,7 +2285,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     var batteryText: String {
         let b = batt.map { String(format: "%.1f °C", $0) } ?? "—"
-        return "\(b) · \(ac ? "AC" : "battery")"
+        let src = ac ? "AC" : "battery"
+        // Battery heat lowers the cap's engage point, so say so when it is in
+        // effect: the UI and the governor must tell the same story.
+        return batteryHot ? "\(b) · \(src) · warm, capping earlier" : "\(b) · \(src)"
     }
 
     var guardTrailing: String {
@@ -2954,6 +2964,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         temp = s["cpu_temp"] as? Double
         fan = s["fan_rpm"] as? Double
         batt = s["battery_temp"] as? Double
+        batteryHot = s["battery_hot"] as? Bool ?? false
         ac = s["ac_power"] as? Bool ?? false
         limit = s["speed_limit"] as? Int
         turbo = s["turbo_mhz"] as? Int

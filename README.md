@@ -203,8 +203,8 @@ the download before opening it:
 
 ```bash
 cd ~/Downloads
-shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.8.1.dmg
-md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.8.1.dmg
+shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.8.3.dmg
+md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.8.3.dmg
 ```
 
 ## Local setup
@@ -245,8 +245,8 @@ Publishing is tag-driven (`.github/workflows/release.yml`). Bump
 `app/Info.plist`, then:
 
 ```bash
-git tag -a v1.8.1 -m "ThermalGuard 1.8.1"   # the tag message becomes the release notes
-git push origin v1.8.1
+git tag -a v1.8.3 -m "ThermalGuard 1.8.3"   # the tag message becomes the release notes
+git push origin v1.8.3
 ```
 
 CI runs the test suite, rebuilds from that commit, and attaches the DMG,

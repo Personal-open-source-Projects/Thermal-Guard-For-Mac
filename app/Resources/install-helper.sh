@@ -68,6 +68,7 @@ cat > "$PLIST_DST" <<PLIST
     <key>ProgramArguments</key><array><string>${HELPER_DST}</string></array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
     <key>Umask</key><integer>77</integer>
     <key>ProcessType</key><string>Interactive</string>
     <key>StandardErrorPath</key><string>/var/log/thermalguard.err</string>
@@ -78,8 +79,15 @@ PLIST
 chown root:wheel "$PLIST_DST"
 chmod 644 "$PLIST_DST"
 
+# A socket left behind by a dead process would shadow the fresh daemon.
+rm -f /var/run/thermalguard.sock
+
+# Idempotent: re-running the installer replaces the daemon and reloads it, and
+# because the job lives in /Library/LaunchDaemons it is started by launchd at
+# every boot without asking for a password again.
 launchctl bootout "system/${LABEL}" 2>/dev/null || true
 launchctl bootstrap system "$PLIST_DST" || true
 launchctl enable "system/${LABEL}" 2>/dev/null || true
+launchctl kickstart -k "system/${LABEL}" 2>/dev/null || true
 
 echo "installed"

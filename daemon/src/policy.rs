@@ -63,6 +63,20 @@ const THROTTLE_LIMIT: u32 = 95;
 /// Throttling only counts as a reason to cap once the chip is at least warm,
 /// so a brief OS scheduling dip does not clamp the power envelope.
 const AUTO_THROTTLE_C: f64 = 72.0;
+/// Minimum time the cap stays released before the governor may engage it
+/// again, so a load that merely straddles a threshold cannot cycle it.
+pub const AUTO_MIN_OFF_S: u64 = 30;
+/// Re-engaging inside [`AUTO_MIN_OFF_S`] is only allowed when the chip is this
+/// far above the mode's engage threshold: real heat beats the quiet window.
+const AUTO_CRITICAL_MARGIN_C: f64 = 4.0;
+/// The throttle path must clear the release threshold by this much before it
+/// may engage. Without it a release at 74 °C re-engaged at 72 °C on the very
+/// next tick while the OS still reported throttling, so the cap flipped on and
+/// off every dwell window for as long as the machine sat at ~73 °C.
+const THROTTLE_ENGAGE_MARGIN_C: f64 = 2.0;
+/// Battery heat may lower the engage threshold, but never close enough to the
+/// release threshold to remove the hysteresis altogether.
+const BATTERY_MIN_HYSTERESIS_C: f64 = 2.0;
 
 /// Fraction of the SMC's own min..max fan range that "quiet" asks for. At the
 /// bottom of the range the fan is inaudible on this chassis.
@@ -99,6 +113,35 @@ pub fn quiet_fan_target(fan_min: Option<f64>, fan_max: Option<f64>) -> Option<f6
         Some(target)
     } else {
         None
+    }
+}
+
+/// The fan maximum, validated with exactly the same rules as the quiet target:
+/// a nonsense answer from the SMC must never reach a privileged write.
+pub fn max_fan_target(fan_min: Option<f64>, fan_max: Option<f64>) -> Option<f64> {
+    let hi = fan_max?;
+    if !hi.is_finite() || hi <= 0.0 || hi > MAX_PLAUSIBLE_FAN_RPM {
+        return None;
+    }
+    let lo = fan_min
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v < hi)
+        .unwrap_or(0.0);
+    Some(hi.clamp(lo, hi))
+}
+
+/// May the cap engage again after it was released?
+///
+/// Pure and time-driven by the caller: inside [`AUTO_MIN_OFF_S`] only genuine
+/// heat (a reading well above the mode's own engage threshold) re-engages it,
+/// so an unchanged warm workload cannot toggle the cap every dwell window.
+pub fn reengage_allowed(t: Tuning, uncapped_for_s: u64, temp_c: Option<f64>) -> bool {
+    if uncapped_for_s >= AUTO_MIN_OFF_S {
+        return true;
+    }
+    match temp_c {
+        Some(v) if v.is_finite() && v >= t.engage_c + AUTO_CRITICAL_MARGIN_C => true,
+        // Unreadable is not evidence of heat: honour the quiet window.
+        _ => false,
     }
 }
 
@@ -190,24 +233,27 @@ impl Tuning {
 /// earlier to compensate. This is a modest shift: the battery alone cannot cause
 /// capping (the SoC still must be warm), but it lowers the engage threshold.
 pub const BATTERY_HOT_C_SHIFT: f64 = 3.0;
-#[cfg(test)]
-pub fn auto_should_cap(
-    temp_c: Option<f64>,
-    speed_limit: Option<u32>,
-    cap_active: bool,
-    capped_for_s: u64,
-) -> bool {
-    auto_should_cap_with(
-        Tuning::for_mode(Mode::Auto),
-        temp_c,
-        speed_limit,
-        cap_active,
-        capped_for_s,
-        false, // battery_hot
-        false, // on_ac
-    )
-}
+/// A battery at or above this is hot enough to add meaningful chassis heat.
+pub const BATTERY_HOT_C: f64 = 45.0;
+/// ...and it must fall well below it before the compensation is dropped, so a
+/// battery hovering at the threshold cannot flicker the cap's engage point.
+pub const BATTERY_COOL_C: f64 = 42.0;
 
+/// Latching battery-heat state, kept in sync with the charging state the rest
+/// of the governor uses.
+///
+/// Charging temperature moves slowly but its noise straddles the threshold, and
+/// an unlatched flag shifted the engage temperature by [`BATTERY_HOT_C_SHIFT`]
+/// on every sample — which is what made the cap flicker while charging. An
+/// unreadable temperature keeps the previous verdict rather than guessing.
+pub fn battery_heat_latched(temp_c: Option<f64>, was_hot: bool) -> bool {
+    match temp_c {
+        Some(t) if t.is_finite() && t >= BATTERY_HOT_C => true,
+        Some(t) if t.is_finite() && t <= BATTERY_COOL_C => false,
+        Some(t) if t.is_finite() => was_hot,
+        _ => was_hot,
+    }
+}
 /// Same governor, but with thresholds supplied by the caller so the fan
 /// preference can shift them.
 /// Adaptive governor with optional battery-heat compensation.
@@ -223,9 +269,16 @@ pub fn auto_should_cap_with(
     battery_hot: bool,
     on_ac: bool,
 ) -> bool {
-    let engage_c = if battery_hot && on_ac { t.engage_c - BATTERY_HOT_C_SHIFT } else { t.engage_c };
+    let mut engage_c = t.engage_c;
+    if battery_hot && on_ac {
+        // Never let battery heat collapse the hysteresis: the engage threshold
+        // must stay clearly above the release threshold or the cap flaps.
+        engage_c = (engage_c - BATTERY_HOT_C_SHIFT).max(t.release_c + BATTERY_MIN_HYSTERESIS_C);
+    }
+    // Throttling re-engages only above the release point, with margin.
+    let throttle_engage_c = AUTO_THROTTLE_C.max(t.release_c + THROTTLE_ENGAGE_MARGIN_C);
     let hot = temp_c.map(|v| v >= engage_c).unwrap_or(false);
-    let warm = temp_c.map(|v| v >= AUTO_THROTTLE_C).unwrap_or(false);
+    let warm = temp_c.map(|v| v >= throttle_engage_c).unwrap_or(false);
     let throttled = speed_limit.map(|l| l < THROTTLE_LIMIT).unwrap_or(false);
     let cooled = temp_c.map(|v| v <= t.release_c).unwrap_or(false);
 
@@ -340,7 +393,7 @@ mod tests {
         assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(78.0), Some(100), false, 0, false, false));
         assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(88.0), Some(100), false, 0, false, false));
         // even at moderate temperature, OS throttling means stop generating heat
-        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(74.0), Some(80), false, 0, false, false));
+        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(77.0), Some(80), false, 0, false, false));
     }
 
     #[test]
@@ -366,7 +419,7 @@ mod tests {
         // cold but OS limit low: do not clamp a cool chip
         assert!(!auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(55.0), Some(80), false, 0, false, false));
         // warm and being starved: clamp
-        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(74.0), Some(80), false, 0, false, false));
+        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(77.0), Some(80), false, 0, false, false));
     }
 
     #[test]
@@ -549,7 +602,26 @@ mod tests {
     }
 
     #[test]
-    fn battery_hot_does_not_cause_capping_when_soC_is_cool() {
+    fn battery_heat_state_is_latched_around_the_threshold() {
+        // Rising through the threshold turns it on...
+        assert!(battery_heat_latched(Some(BATTERY_HOT_C), false));
+        // ...and it stays on through the band, so a noisy reading cannot flip
+        // the engage temperature on every sample.
+        assert!(battery_heat_latched(Some(44.0), true));
+        assert!(battery_heat_latched(Some(43.0), true));
+        // Only a genuinely cooler battery drops it.
+        assert!(!battery_heat_latched(Some(BATTERY_COOL_C), true));
+        assert!(!battery_heat_latched(Some(30.0), true));
+        // No hysteresis the other way: a cool battery needs real heat again.
+        assert!(!battery_heat_latched(Some(44.9), false));
+        // Unreadable keeps the previous verdict instead of guessing.
+        assert!(battery_heat_latched(None, true));
+        assert!(!battery_heat_latched(None, false));
+        assert!(battery_heat_latched(Some(f64::NAN), true));
+    }
+
+    #[test]
+    fn battery_hot_does_not_cap_a_cool_soc() {
         // Battery hot alone should not cap if SoC is cool
         let d = evaluate(Mode::Auto, FanIntent::Auto, Some(60.0), Some(100), false, 0, &[], true, true);
         assert!(!d.cap_power, "battery hot alone should not cap when SoC is cool");
@@ -567,5 +639,49 @@ mod tests {
         assert!(avg < AUTO_ENGAGE_C, "smoothed average {} should be below engage threshold {}", avg, AUTO_ENGAGE_C);
         // Verify that some individual readings would have triggered capping
         assert!(readings.iter().any(|&r| r >= AUTO_ENGAGE_C), "some readings should cross threshold");
+    }
+
+    #[test]
+    fn throttle_path_cannot_reengage_at_the_release_point() {
+        // Regression: the cap released at 74 °C re-engaged at 72 °C on the next
+        // tick while the OS still reported throttling, so it cycled on and off
+        // every dwell window for as long as the machine sat at ~73 °C.
+        let t = Tuning::for_mode(Mode::Auto);
+        assert!(!auto_should_cap_with(t, Some(74.0), Some(80), false, 0, false, false));
+        assert!(!auto_should_cap_with(t, Some(75.9), Some(80), false, 0, false, false));
+        // Above the release point plus the margin it may engage.
+        assert!(auto_should_cap_with(t, Some(77.0), Some(80), false, 0, false, false));
+    }
+
+    #[test]
+    fn battery_heat_never_collapses_the_hysteresis() {
+        // Engage shifts 78 -> 75, but the release is 74: keep 2 °C of margin,
+        // so a 75 °C reading must not engage the cap.
+        assert!(!auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(75.0), Some(100), false, 0, true, true));
+        assert!(auto_should_cap_with(Tuning::for_mode(Mode::Auto), Some(76.0), Some(100), false, 0, true, true));
+    }
+
+    #[test]
+    fn the_cap_is_held_off_for_a_minimum_window() {
+        let t = Tuning::for_mode(Mode::Auto);
+        // Just released, warm but not critical: hold off.
+        assert!(!reengage_allowed(t, 0, Some(78.0)));
+        assert!(!reengage_allowed(t, AUTO_MIN_OFF_S - 1, Some(80.0)));
+        // Genuinely hot: the quiet window never blocks protection.
+        assert!(reengage_allowed(t, 0, Some(t.engage_c + AUTO_CRITICAL_MARGIN_C)));
+        // Window elapsed, or no usable reading at all: allowed.
+        assert!(reengage_allowed(t, AUTO_MIN_OFF_S, Some(70.0)));
+        assert!(reengage_allowed(t, AUTO_MIN_OFF_S, None));
+    }
+
+    #[test]
+    fn max_fan_target_refuses_to_write_an_implausible_value() {
+        assert_eq!(max_fan_target(None, None), None);
+        assert_eq!(max_fan_target(Some(0.0), Some(f64::NAN)), None);
+        assert_eq!(max_fan_target(Some(0.0), Some(0.0)), None);
+        assert_eq!(max_fan_target(Some(0.0), Some(50_000.0)), None);
+        assert_eq!(max_fan_target(Some(1300.0), Some(8000.0)), Some(8000.0));
+        // A minimum above the maximum collapses to the maximum, never beyond.
+        assert_eq!(max_fan_target(Some(9000.0), Some(8000.0)), Some(8000.0));
     }
 }

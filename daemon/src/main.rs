@@ -68,6 +68,12 @@ fn state_path() -> String {
 const TRIM_GRACE_S: u64 = 30;
 /// A service that refused (SIP) is not retried on every tick.
 const TRIM_SIP_BACKOFF_S: u64 = 300;
+/// How long to wait before retrying a power-cap change the system refused, so
+/// a failed write cannot turn into a `pmset` spawn on every tick.
+const CAP_FAIL_BACKOFF_S: u64 = 60;
+/// A call or video keeps the media shield up this long after its last busy
+/// sample, so one quiet 4 s sample cannot flap the shield (and the cap) off.
+const MEDIA_HOLD_S: u64 = 20;
 
 fn trim_grace_s() -> u64 {
     if overrides_allowed() {
@@ -88,6 +94,9 @@ struct Shared {
     fan_min: Option<f64>,
     fan_max: Option<f64>,
     battery_temp: Option<f64>,
+    /// Latched battery-heat verdict, so the cap's engage point cannot flicker
+    /// while the battery temperature hovers around its threshold.
+    battery_hot: bool,
     speed_limit: Option<u32>,
     ac: bool,
     cap_active: bool,
@@ -167,12 +176,16 @@ impl Default for Shared {
     fn default() -> Self {
         Shared {
             mode: Mode::Auto,
-            fan_intent: FanIntent::Auto,
+            // Silent by default: where the SMC accepts a low target the machine
+            // runs quietly, and where it does not the governor treats the
+            // preference as Auto, so silence never costs speed for nothing.
+            fan_intent: FanIntent::Quiet,
             cpu_temp: None,
             fan_rpm: None,
             fan_min: None,
             fan_max: None,
             battery_temp: None,
+            battery_hot: false,
             speed_limit: None,
             ac: false,
             cap_active: false,
@@ -374,6 +387,7 @@ fn state_json(sh: &Shared) -> String {
         format!("\"fan_min\":{}", opt_num(sh.fan_min)),
         format!("\"fan_max\":{}", opt_num(sh.fan_max)),
         format!("\"battery_temp\":{}", opt_num(sh.battery_temp)),
+        json::b("battery_hot", sh.battery_hot),
         match sh.speed_limit {
             Some(v) => json::i("speed_limit", v as i64),
             None => "\"speed_limit\":null".to_string(),
@@ -546,7 +560,7 @@ fn drive_fan(smc: &Option<smc::Smc>, sh: &mut Shared, temp_c: Option<f64>) {
     // Option: `None` means the SMC could not even tell us its range.
     let want: Option<FanCommand> = match sh.fan_intent {
         FanIntent::Auto => Some(FanCommand::Release),
-        FanIntent::Max => sh.fan_max.map(FanCommand::Target),
+        FanIntent::Max => policy::max_fan_target(sh.fan_min, sh.fan_max).map(FanCommand::Target),
         FanIntent::Quiet => {
             // A call or a video file is playing: cooling wins over silence, so
             // the SMC gets the fan back for the duration.
@@ -619,6 +633,10 @@ fn drive_fan(smc: &Option<smc::Smc>, sh: &mut Shared, temp_c: Option<f64>) {
             match applied {
                 Some(a) if (a - target).abs() <= tol => {
                     sh.fan_supported = Some(true);
+                    // Only once the target is proven accepted do we take the
+                    // fan out of Apple's curve: a model that ignores F0Tg must
+                    // never be left with its own cooling ramp disabled.
+                    let _ = s.write_raw("F0Md", "ui8", &[1]);
                     let actual = s.read_f64("F0Ac");
                     sh.fan_target = Some(target);
                     sh.fan_note = match actual {
@@ -630,6 +648,9 @@ fn drive_fan(smc: &Option<smc::Smc>, sh: &mut Shared, temp_c: Option<f64>) {
                     };
                 }
                 other => {
+                    // Hand the fan straight back: never leave it in manual mode
+                    // after a refused target.
+                    let _ = s.write_raw("F0Md", "ui8", &[0]);
                     sh.fan_failed = Some(Instant::now());
                     sh.fan_supported = Some(false);
                     sh.fan_target = None;
@@ -1151,19 +1172,28 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
             match f {
                 FanIntent::Max => {
                     // Never ask for a value outside the SMC's own reported range.
-                    let hi = sh.fan_max.unwrap_or(7200.0);
-                    let lo = sh.fan_min.unwrap_or(0.0);
-                    let target = hi.clamp(lo, hi.max(lo));
-                    let res = probe_fan_support(&smc_holder(), &mut sh, target);
-                    sh.fan_supported = res;
-                    push_event(
-                        &mut sh,
-                        match res {
-                            Some(true) => "fan target -> max (verified by read-back)",
-                            Some(false) => "fan control unsupported on this model",
-                            None => "fan target unreadable",
-                        },
-                    );
+                    match policy::max_fan_target(sh.fan_min, sh.fan_max) {
+                        Some(target) => {
+                            let res = probe_fan_support(&smc_holder(), &mut sh, target);
+                            sh.fan_supported = res;
+                            push_event(
+                                &mut sh,
+                                match res {
+                                    Some(true) => "fan target -> max (verified by read-back)",
+                                    Some(false) => "fan control unsupported on this model",
+                                    None => "fan target unreadable",
+                                },
+                            );
+                        }
+                        None => {
+                            // No trustworthy range: never write a guessed RPM.
+                            sh.fan_supported = None;
+                            sh.fan_note =
+                                "SMC fan range unreadable; the fan is left to Apple's curve."
+                                    .into();
+                            push_event(&mut sh, "fan target skipped: SMC range unreadable");
+                        }
+                    }
                 }
                 FanIntent::Quiet => {
                     sh.fan_quiet_allowed = true;
@@ -1201,7 +1231,7 @@ fn smc_holder() -> Option<smc::Smc> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        println!("thermalguardd 1.8.1");
+        println!("thermalguardd 1.8.3");
         return;
     }
     if args.iter().any(|a| a == "--memory-probe") {
@@ -1262,6 +1292,10 @@ fn main() {
         let audio_guard_off = json::get_bool(&saved, "audio_guard") == Some(false);
         let memory_reclaim_off = json::get_bool(&saved, "memory_reclaim") == Some(false);
         let auto_trim = json::get_bool(&saved, "auto_trim") != Some(false);
+        let saved_fan = json::get_str(&saved, "fan_intent").and_then(|v| FanIntent::parse(&v));
+        // The cap is persisted like the mode: a crash while it was engaged must
+        // not leave the machine capped while the daemon believes it is not.
+        let cap_was_on = json::get_bool(&saved, "cap_active") == Some(true);
         let tracked: Vec<String> = json::get_str_array(&saved, "auto_trimmed")
             .unwrap_or_default()
             .into_iter()
@@ -1277,6 +1311,13 @@ fn main() {
         sh.audio_guard = !audio_guard_off;
         sh.memory_reclaim = !memory_reclaim_off;
         sh.auto_trim = auto_trim;
+        if let Some(f) = saved_fan {
+            sh.fan_intent = f;
+        }
+        if cap_was_on {
+            sh.cap_active = true;
+            log_line("restored power cap state (engaged)");
+        }
         sh.auto_trimmed = tracked;
         sh.auto_trimmed.sort();
         sh.auto_trimmed.dedup();
@@ -1377,9 +1418,26 @@ fn main() {
     let mut mem_samples: Vec<(Instant, f64, f64)> = Vec::new();
     let mut last_net_scan = Instant::now() - Duration::from_secs(30);
     let mut logged_cap = false;
+    // The last process sample survives between scans (see the sampling block),
+    // and the media shield stays up for a short hold after the last busy one.
+    let mut last_procs: Vec<procs::Proc> = Vec::new();
+    let mut media_until: Option<Instant> = None;
     // When the power cap last changed hands, so the Auto governor can enforce
-    // its dwell time and cannot flap every tick.
-    let mut capped_since: Option<Instant> = None;
+    // its dwell time and cannot flap every tick. A cap restored from the state
+    // file keeps its dwell instead of being released on the first tick.
+    let cap_restored = shared.lock().unwrap().cap_active;
+    let mut capped_since: Option<Instant> = if cap_restored {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    let mut uncapped_since: Option<Instant> = if cap_restored {
+        None
+    } else {
+        Some(Instant::now())
+    };
+    // A refused `pmset` write is retried after a pause, not on every tick.
+    let mut cap_failed: Option<Instant> = None;
 
     // Temperature smoothing: a small ring buffer to reduce SMC noise.
     // The SMC can return slightly different values on consecutive reads,
@@ -1454,18 +1512,34 @@ fn main() {
             (sh.mode, sh.cap_active)
         };
 
-        let procs_sample = if last_demote_scan.elapsed() >= Duration::from_secs(4) {
+        // `ps` is a fork, so the process list is refreshed every 4 s and *kept*
+        // for the ticks in between. Deriving media detection, demotion and the
+        // audio signal from an empty sample made every other tick look idle:
+        // the media shield dropped and re-applied the power cap, demoted
+        // processes were restored and re-demoted, and the audio spike streak
+        // reset before it could ever reach its threshold.
+        let procs_fresh = last_demote_scan.elapsed() >= Duration::from_secs(4);
+        if procs_fresh {
             last_demote_scan = Instant::now();
-            procs::sample(14)
-        } else {
-            Vec::new()
-        };
+            let sampled = procs::sample(14);
+            if !sampled.is_empty() {
+                last_procs = sampled;
+            }
+        }
+        let procs_sample: Vec<procs::Proc> = last_procs.clone();
 
         // A busy browser or call app means the user is watching or talking:
-        // that session is protected from throttling and from the power cap.
-        let media_active = procs_sample
-            .iter()
-            .any(|p| p.cpu >= 6.0 && procs::is_media(&p.name));
+        // that session is protected from throttling and from the power cap. A
+        // busy sample holds the shield up for a moment, so a single quiet
+        // sample in the middle of a call cannot hand the cap back and forth.
+        if procs_fresh
+            && procs_sample
+                .iter()
+                .any(|p| p.cpu >= 6.0 && procs::is_media(&p.name))
+        {
+            media_until = Some(Instant::now() + Duration::from_secs(MEDIA_HOLD_S));
+        }
+        let media_active = media_until.map(|t| Instant::now() < t).unwrap_or(false);
 
         // coreaudiod is protected from demotion, so its own CPU share is a
         // clean signal: a healthy engine idles near zero.
@@ -1511,19 +1585,36 @@ fn main() {
             .collect();
 
         let capped_for_s = capped_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-        let fan_intent = {
+        let (fan_intent, fan_held) = {
             let sh = shared.lock().unwrap();
-            sh.fan_intent
+            (
+                sh.fan_intent,
+                sh.fan_supported == Some(true) && sh.fan_target.is_some(),
+            )
+        };
+        // Silent only costs performance where it actually buys silence. If the
+        // fans cannot be held low on this model, the earlier cap and the harder
+        // demotion that come with the preference would be a pure speed loss.
+        let policy_fan = if fan_intent == FanIntent::Quiet && !fan_held {
+            FanIntent::Auto
+        } else {
+            fan_intent
         };
         let guard_on = {
             let sh = shared.lock().unwrap();
             sh.media_guard
         };
-        let battery_hot = system::battery_is_hot(battery_temp);
-        let decision = policy::apply_media_guard(
+        // The battery/charging side of the policy: latched, so a battery
+        // sitting on its threshold cannot shift the cap's engage point on
+        // every sample (and the shift only applies while charging on AC).
+        let battery_hot = policy::battery_heat_latched(
+            battery_temp,
+            shared.lock().unwrap().battery_hot,
+        );
+        let mut decision = policy::apply_media_guard(
             policy::evaluate(
                 mode,
-                fan_intent,
+                policy_fan,
                 cpu_temp,
                 speed_limit,
                 cap_active,
@@ -1535,18 +1626,53 @@ fn main() {
             media_active && guard_on,
             cpu_temp,
         );
+        // Stability: once released, the cap stays off for a quiet window so a
+        // workload sitting on the threshold cannot toggle it every dwell. Only
+        // the adaptive modes have a threshold to sit on; a mode the user chose
+        // explicitly engages at once, and a chip with no usable reading is
+        // never left unprotected because of a timer.
+        if !cap_active
+            && decision.cap_power
+            && matches!(mode, Mode::Auto | Mode::Balanced)
+        {
+            let off_for_s = uncapped_since
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(u64::MAX);
+            if !policy::reengage_allowed(
+                policy::Tuning::for_mode_fan(mode, policy_fan),
+                off_for_s,
+                cpu_temp,
+            ) {
+                decision.cap_power = false;
+            }
+        }
 
         // 1) Power envelope.
         if decision.cap_power != cap_active {
-            match system::set_low_power_mode(decision.cap_power) {
+            // A refused change is retried after a pause, never every tick.
+            let backing_off = cap_failed
+                .map(|t| t.elapsed().as_secs() < CAP_FAIL_BACKOFF_S)
+                .unwrap_or(false);
+            if !backing_off {
+                match system::set_low_power_mode(decision.cap_power) {
                 Ok(_) => {
+                    cap_failed = None;
                     capped_since = if decision.cap_power {
                         Some(Instant::now())
                     } else {
                         None
                     };
+                    uncapped_since = if decision.cap_power {
+                        None
+                    } else {
+                        Some(Instant::now())
+                    };
                     let mut sh = shared.lock().unwrap();
                     sh.cap_active = decision.cap_power;
+                    // Persist at once: a crash between the `pmset` write and the
+                    // periodic state write would otherwise lose the fact that
+                    // the machine is capped.
+                    sh.dirty = true;
                     if decision.cap_power {
                         let msg = format!(
                             "power cap ON (turbo ratio {} -> {})",
@@ -1557,14 +1683,18 @@ fn main() {
                     } else {
                         push_event(&mut sh, "power cap OFF (full turbo available)");
                     }
-                    logged_cap = true;
+                    logged_cap = false;
                 }
                 Err(e) => {
+                    // Back off, or a machine that refuses the write would spawn
+                    // `pmset` on every 2 s tick for the life of the process.
+                    cap_failed = Some(Instant::now());
                     if !logged_cap {
                         let mut sh = shared.lock().unwrap();
                         push_event(&mut sh, &format!("power cap change failed: {}", e));
                         logged_cap = true;
                     }
+                }
                 }
             }
         }
@@ -1575,8 +1705,17 @@ fn main() {
         // process may have exited and its pid been reused in the meantime.
         // Confirm identity immediately before touching it, so background QoS
         // is never applied to an unrelated process.
+        let already: Vec<u32> = {
+            let sh = shared.lock().unwrap();
+            sh.demoted.iter().map(|(p, _)| *p).collect()
+        };
         let mut newly = Vec::new();
         for (pid, name) in &decision.demote {
+            // Already demoted: re-applying it every tick would just fork `ps`
+            // for a process whose priority has not changed.
+            if already.contains(pid) {
+                continue;
+            }
             if procs::same_process(*pid, name) && procs::demote(*pid) {
                 newly.push((*pid, name.clone()));
             }
@@ -1588,7 +1727,11 @@ fn main() {
         let audio_action = {
             let mut sh = shared.lock().unwrap();
             sh.coreaudiod_cpu = coreaudiod_cpu;
-            sh.audio_streak = audio::spike_streak(sh.audio_streak, coreaudiod_cpu);
+            // Only a fresh sample is evidence: folding the cached one twice
+            // would count the same observation as a sustained spike.
+            if procs_fresh {
+                sh.audio_streak = audio::spike_streak(sh.audio_streak, coreaudiod_cpu);
+            }
             sh.audio_restarts_window
                 .retain(|t| t.elapsed().as_secs() < 3600);
             let inputs = audio::Inputs {
@@ -1707,6 +1850,7 @@ fn main() {
             sh.fan_min = fan_min;
             sh.fan_max = fan_max;
             sh.battery_temp = battery_temp;
+            sh.battery_hot = battery_hot;
             sh.speed_limit = speed_limit;
             sh.ac = ac;
             sh.procs = procs_sample.clone();

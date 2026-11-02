@@ -36,6 +36,9 @@ regression test.
 | 15 | **Low** | Auto-trim leaves services disabled if the app is uninstalled while trimmed. | Documented; the daemon restores tracked services on selecting Off / toggling the trimmer off / startup. Uninstall instructions now tell the user to turn Auto-trim off first. | manual |
 | 16 | **Medium** | An automatic `coreaudiod` restart is a root signal to a shared system daemon: unthrottled it would be a denial-of-service on audio, and a caller-supplied target would be arbitrary process signalling. | The watchdog only fires on two consecutive samples above 20 % CPU, at most once per 10 min and 3×/hour, sending one SIGTERM (never SIGKILL) to the compiled-in name `coreaudiod` via absolute `/usr/bin/killall` with an argv array; the relaunch is verified by re-reading the PID. The `audio_restart` IPC hook exists only when `overrides_allowed()` (non-root + `THERMALGUARD_TESTING=1`) and is refused by the installed daemon. | `audio::*` (6 unit tests), `audio_watchdog_is_on_by_default_and_togglable`, `audio_reset_path_uses_sigterm_and_is_verified` |
 | 17 | **Medium** | An automatic `purge` driven by IPC input could be turned into a repeated machine-wide stall, or accept caller-supplied flags. | The daemon decides on its own measured numbers; the IPC setting is a strict boolean only. `purge` is called with an empty argv and absolute path, only when the kernel reports warning/critical pressure, ≥ 1 GB is provably reclaimable, swap is below 70 %, and the 30 min / 2-per-hour budget allows it. The `memory_reclaim_now` hook exists only under `overrides_allowed()` and is refused by the installed daemon. | `memory::*` (6 unit tests), `memory_reclaim_path_runs_without_arguments_and_is_verified`, `memory_reclaim_is_strictly_boolean` |
+| 18 | **Medium** | The applied power cap was not part of the persisted state, so a crash or restart while capped left macOS capped while the daemon believed nothing was applied — the cap could stay on indefinitely (the reported "stuck cap"), or be re-applied to a machine the user had since set to Off. | `cap_active` is written to the state file and restored on load, a restored cap keeps its dwell instead of being released on the first tick, and Off releases it on the next tick. | `power_cap_state_survives_a_restart_and_is_released_by_off` |
+| 19 | **Medium** | A refused `pmset` write was retried on every 2 s tick for the life of the process: a machine that rejects the write would fork `pmset` forever, and the flapping attempt was visible in the state. | A refused cap change backs off for 60 s and is logged once; the applied state is only updated after a successful write. | `power_cap_turns_on_with_a_cooling_mode_and_off_again` (exactly one on and one off write, no flapping) |
+| 20 | **Low** | Fan writes could take the fan out of Apple's curve on a model that ignores the target, leaving the chassis with no cooling ramp. | `F0Md = 1` (manual) is only written *after* `F0Tg` read-back proved the target was accepted, and any refused/failed target writes `F0Md = 0` again. The maximum target goes through the same plausibility checks as the quiet target (`max_fan_target`). | `max_fan_target_refuses_to_write_an_implausible_value`, `fan_preference_defaults_to_silent` |
 
 ## Auto-trim safety invariants
 
@@ -162,7 +165,8 @@ regression test.
 | Hardened runtime (`--options runtime`) on both binaries | code-injection / debugger hardening | `codesign -dv` → `flags=0x10002(runtime,adhoc)` |
 | Installer verifies `codesign --verify --strict` on the bundle before copying as root | a tampered bundle cannot install a root payload | installer guard |
 | LaunchDaemon `Umask 77` | daemon-created files are owner-only by default | plist |
-| Fan target clamped to the SMC-reported min/max | no out-of-range SMC writes | code review |
+| Fan target clamped to the SMC-reported min/max, and manual mode (`F0Md`) entered only after a verified target | no out-of-range SMC writes, and no model left without Apple's cooling ramp | `quiet_fan_target_*`, `max_fan_target_refuses_to_write_an_implausible_value` |
+| Test-only `THERMALGUARD_PMSET` override, refused when root (like `PURGE`/`KILLALL`) | the cap path can be exercised end to end without touching the host's power settings | `power_cap_turns_on_with_a_cooling_mode_and_off_again` |
 | `THERMALGUARD_*` path overrides ignored when running as root (test-only, gated) | a planted env var cannot redirect the privileged daemon's socket or state | `env_path_overrides_are_ignored_without_the_testing_flag` |
 | Log rotation above 512 KiB, trimmed at a line boundary, `0600`, symlink-refused | no unbounded root-owned log growth filling the disk | code review |
 | Priority restore verifies the process identity (`ps -o comm=`) before acting | a recycled PID cannot be the wrong process we hand priority back to | `identity_check_rejects_dead_pids` |
@@ -200,6 +204,14 @@ other privileged sink:
   the SMC echoes the value.
 - **A refusal is not retried in a loop** — 2-minute backoff, so a model without
   fan control cannot be hammered once per tick.
+- **Manual mode is entered last.** `F0Md = 1` is written only after the target
+  read-back proved the SMC accepted it, and a refused target writes `F0Md = 0`
+  straight back: disabling Apple's own curve on a model that ignores `F0Tg`
+  would otherwise leave the chassis with no cooling ramp.
+- **Silence never costs speed for nothing.** The earlier cap and the harder
+  demotion that come with the Silent preference are only applied while a low fan
+  target is actually held; where the SMC refuses one, the governor behaves as
+  Auto instead of trading performance for silence it cannot deliver.
 - **Safety over silence:** a silent target is dropped at 88 °C and only
   re-applied below 80 °C, and an unreadable temperature counts as unsafe
   (`quiet_fan_is_released_for_heat_and_only_resumes_once_cool`).
@@ -210,7 +222,7 @@ other privileged sink:
 ## Reproduce the checks
 
 ```bash
-cargo test --manifest-path daemon/Cargo.toml   # 65 unit + 20 integration tests
+cargo test --manifest-path daemon/Cargo.toml   # 95 unit + 30 integration tests
 
 # live checks against the installed daemon
 stat -f "%Sp %Su" /var/run/thermalguard.sock      # expect srw------- <you>
