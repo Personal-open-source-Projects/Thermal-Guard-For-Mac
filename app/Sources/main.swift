@@ -1526,10 +1526,10 @@ struct RootView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 12))
                     .foregroundStyle(.orange)
-                Text(d.helperInstallState == .installing ? "Installing thermal helper…" : "Install the thermal helper to begin")
+                Text(helperBannerTitle)
                     .font(.system(size: 12, weight: .semibold))
             }
-            Text("One privileged install. It reads the SMC thermometer and applies the power cap; nothing else on this Mac is touched.")
+            Text(helperBannerDescription)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1547,13 +1547,31 @@ struct RootView: View {
                 Button {
                     d.installHelper()
                 } label: {
-                    Text("Install Thermal Helper…").frame(maxWidth: .infinity)
+                    Text(helperBannerButtonTitle).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
             }
         }
         .cardSurface()
+    }
+
+    private var helperBannerTitle: String {
+        if d.helperInstallState == .installing { return "Installing thermal helper…" }
+        return d.helperPresent
+            ? "Thermal helper is installed but not responding"
+            : "Install the thermal helper to begin"
+    }
+
+    private var helperBannerDescription: String {
+        if d.helperPresent {
+            return "The machine-wide helper is loaded, but its status socket is unavailable. Repair it to reload the service."
+        }
+        return "One privileged install enables thermal protection for every account on this Mac."
+    }
+
+    private var helperBannerButtonTitle: String {
+        d.helperPresent ? "Repair Thermal Helper…" : "Install Thermal Helper…"
     }
 
     // MARK: controls
@@ -2340,7 +2358,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // Auto-install the privileged helper once on first launch, and ensure
         // the app starts at login so thermal protection is active after every
         // restart without repeated admin prompts.
-        if !helperRunning, !UserDefaults.standard.bool(forKey: helperAutoInstallAttemptedKey) {
+        if !helperRunning, !helperPresent,
+           !UserDefaults.standard.bool(forKey: helperAutoInstallAttemptedKey) {
             attemptAutoInstall()
         }
         if !loginOn {

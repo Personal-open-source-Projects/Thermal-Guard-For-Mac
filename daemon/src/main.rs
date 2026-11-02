@@ -694,9 +694,9 @@ extern "C" {
     fn geteuid() -> u32;
 }
 
-/// Only root and the logged-in console user may drive this root daemon. The
-/// socket is mode 0666 for convenience, so this check is what actually keeps
-/// other local accounts out.
+/// Root and local interactive accounts may drive this machine-wide daemon.
+/// Socket permissions let launchd start before login; peer credentials reject
+/// system service identities while allowing every local user account.
 fn peer_allowed(stream: &UnixStream) -> bool {
     use std::os::unix::io::AsRawFd;
     let mut uid: u32 = u32::MAX;
@@ -705,7 +705,24 @@ fn peer_allowed(stream: &UnixStream) -> bool {
     if rc != 0 {
         return false;
     }
-    uid == 0 || uid == system::console_uid()
+    peer_uid_allowed(uid)
+}
+
+fn peer_uid_allowed(uid: u32) -> bool {
+    uid == 0 || uid >= 500
+}
+
+#[cfg(test)]
+mod peer_auth_tests {
+    use super::peer_uid_allowed;
+
+    #[test]
+    fn root_and_all_local_user_accounts_are_authorized() {
+        assert!(peer_uid_allowed(0));
+        assert!(peer_uid_allowed(501));
+        assert!(peer_uid_allowed(502));
+        assert!(!peer_uid_allowed(499));
+    }
 }
 
 /// Labels come from the wire, so keep them to a printable safe alphabet before
@@ -1231,7 +1248,7 @@ fn smc_holder() -> Option<smc::Smc> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        println!("thermalguardd 1.8.3");
+        println!("thermalguardd 1.8.4");
         return;
     }
     if args.iter().any(|a| a == "--memory-probe") {
@@ -1355,23 +1372,17 @@ fn main() {
     // IPC listener
     let sock = sock_path();
     let _ = std::fs::remove_file(&sock);
-    // Create the socket 0600 from the very first instant (umask), so there is
-    // no window in which another local user could connect before the chmod.
-    let old_mask = unsafe { umask(0o177) };
+    // The daemon may start before a console user logs in. Keep the socket
+    // reachable across that transition; peer_allowed authenticates every
+    // connection by UID before any command is handled.
+    let old_mask = unsafe { umask(0) };
     let bind_result = UnixListener::bind(&sock);
     unsafe {
         umask(old_mask);
     }
     match bind_result {
         Ok(listener) => {
-            // Owner-only socket: hand it to the logged-in console user, mode
-            // 0600. The peer-credential check stays as defence in depth.
-            let uid = system::console_uid();
-            let gid = system::console_gid();
-            if let Err(e) = std::os::unix::fs::chown(&sock, Some(uid), Some(gid)) {
-                log_line(&format!("socket chown failed: {}", e));
-            }
-            let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666));
 
             let sh = shared.clone();
             thread::spawn(move || {

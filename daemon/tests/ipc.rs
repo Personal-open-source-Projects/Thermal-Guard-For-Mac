@@ -392,14 +392,14 @@ fn arbitrary_apple_service_cannot_be_toggled() {
 }
 
 #[test]
-fn socket_is_owner_only_not_world_writable() {
+fn socket_is_reachable_before_login() {
     use std::os::unix::fs::PermissionsExt;
     let g = start();
     let md = std::fs::metadata(&g.sock).expect("socket metadata");
     assert_eq!(
         md.permissions().mode() & 0o777,
-        0o600,
-        "socket must be owner-only, was {:o}",
+        0o666,
+        "socket must be reachable before login, was {:o}",
         md.permissions().mode() & 0o777
     );
 }

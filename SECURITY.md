@@ -18,7 +18,7 @@ regression test.
 
 | # | Severity | Finding | Fix | Test |
 |---|----------|---------|-----|------|
-| 1 | **High** | Root daemon socket was mode `0666` and accepted commands from *any* local uid — e.g. `agent` could stop a critical third-party service, or disable Spotlight. | Peer credential check with `getpeereid(2)`; only `uid 0` and the console user are served. Unauthorised peers get `{"error":"unauthorised"}` and the attempt is logged. | manual + code path guard |
+| 1 | **High** | Root daemon socket was mode `0666` and accepted commands from *any* local uid — e.g. a system service could stop a critical third-party service, or disable Spotlight. | Peer credential check with `getpeereid(2)`; only `uid 0` and local interactive accounts (`uid >= 500`) are served. System service identities are rejected and logged. | `root_and_all_local_user_accounts_are_authorized`; IPC tests |
 | 2 | **High** | `agent` took `path` and `scope` from the JSON and passed them to `launchctl bootstrap` **as root** → arbitrary root code execution. | The caller supplies a *label* only; the daemon re-scans and resolves path/scope itself, then re-validates with `path_allowed()` (only `/Library/LaunchDaemons`, `/Library/LaunchAgents`, `/Users/*/Library/LaunchAgents`; no `..`, must be `.plist`). | `caller_supplied_path_cannot_bootstrap_an_arbitrary_plist`, `attacker_controlled_paths_are_rejected` |
 | 3 | **Medium** | `apple_set` accepted any `com.apple.*` label, so a caller could disable unrelated Apple services (WindowServer, securityd). | Toggle limited to a curated allowlist (`is_known`); unknown ids return `not a curated macOS service` before any process is spawned. | `arbitrary_apple_service_cannot_be_toggled`, `arbitrary_apple_labels_are_rejected` |
 | 4 | **Medium** | `short_name()` truncated at a *byte* index → a process named with multi-byte UTF-8 aborted the daemon (`panic = "abort"` + `KeepAlive` = crash loop → thermal protection silently lost). | Truncation is char-boundary safe and strips control characters. | `multibyte_names_never_panic_the_daemon`, `control_characters_are_stripped_from_names` |
@@ -155,8 +155,8 @@ regression test.
 
 | Measure | What it buys | Verified by |
 |---|---|---|
-| Socket created `0600` via `umask(0177)` at bind, then `chown`ed to the console user + chmod `0600` | no window where another local user could connect; no world access at all | `socket_is_owner_only_not_world_writable`; live `stat` → `srw------- admin` |
-| `getpeereid(2)` authorisation (root or console uid only) | defence in depth if permissions are ever wrong | live probes |
+| Socket created `0666` so every user session can connect even when launchd starts the daemon before login; `getpeereid(2)` admits root and local interactive UIDs (500+) | startup ordering cannot strand the UI, and system services cannot issue daemon commands | `socket_is_reachable_before_login`; `root_and_all_local_user_accounts_are_authorized` |
+| `getpeereid(2)` authorisation (root or local interactive UID 500+) | blocks system service identities even though the socket is reachable by all user accounts | peer authorization unit test |
 | Bounded request read (8 KiB cap, newline-terminated, 5 s read/write timeouts) | no heap growth, no slowloris thread pile-up | `oversized_request_is_truncated_and_daemon_survives` |
 | Connection cap (16) with RAII counter | no thread-exhaustion from a connect loop | code path |
 | `panic = "unwind"` + `catch_unwind` per handler | a panic drops one connection instead of killing thermal protection | `handler_panics_do_not_take_the_engine_down` |

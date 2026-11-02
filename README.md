@@ -203,8 +203,8 @@ the download before opening it:
 
 ```bash
 cd ~/Downloads
-shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.8.3.dmg
-md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.8.3.dmg
+shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.8.4.dmg
+md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.8.4.dmg
 ```
 
 ## Local setup
@@ -245,8 +245,8 @@ Publishing is tag-driven (`.github/workflows/release.yml`). Bump
 `app/Info.plist`, then:
 
 ```bash
-git tag -a v1.8.3 -m "ThermalGuard 1.8.3"   # the tag message becomes the release notes
-git push origin v1.8.3
+git tag -a v1.8.4 -m "ThermalGuard 1.8.4"   # the tag message becomes the release notes
+git push origin v1.8.4
 ```
 
 CI runs the test suite, rebuilds from that commit, and attaches the DMG,
@@ -298,10 +298,10 @@ locks the fix in. To re-check the guarantees locally:
    `labels_with_control_characters_are_neutralised`,
    `oversized_request_is_truncated_and_daemon_survives`,
    `handler_panics_do_not_take_the_engine_down` and
-   `socket_is_owner_only_not_world_writable`.
+   `socket_is_reachable_before_login` and the peer-authorization unit test.
 2. **Socket exposure** — after installing the helper,
    `ls -l /var/run/thermalguard.sock` shows a root-owned socket; connecting as
-   any uid other than root or the console user must return
+   system-service UIDs below 500 must return
    `{"error":"unauthorised"}` and be logged.
 3. **Privilege boundary** — the UI never runs as root: only the daemon does,
    and it accepts a service *label*, resolving and re-validating the plist path
