@@ -103,8 +103,8 @@ func helperInstalled() -> Bool {
     if let reply = sendRequest("{\"cmd\":\"status\"}"), reply.contains("\"mode\"") {
         return true
     }
-    let out = shell("/bin/launchctl", ["print", "system/\(HELPER_LABEL)"]).1
-    return !out.contains("Could not find service")
+    let (status, _) = shell("/bin/launchctl", ["print", "system/\(HELPER_LABEL)"])
+    return status == 0
 }
 
 // MARK: - Hardware-acceleration guard for video & call apps
@@ -2341,7 +2341,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // the app starts at login so thermal protection is active after every
         // restart without repeated admin prompts.
         if !helperRunning, !UserDefaults.standard.bool(forKey: helperAutoInstallAttemptedKey) {
-            UserDefaults.standard.set(true, forKey: helperAutoInstallAttemptedKey)
             attemptAutoInstall()
         }
         if !loginOn {
@@ -2916,9 +2915,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 helperInstallState = .failed(msg)
                 hint = msg
             } else {
-                helperInstallState = .installed
-                hint = "Helper installed. Thermal protection is active."
+                let (status, output) = shell("/bin/launchctl", ["print", "system/\(HELPER_LABEL)"])
+                if status == 0 {
+                    helperPresent = true
+                    helperInstallState = .installed
+                    hint = "Helper installed. Thermal protection is active."
+                } else {
+                    let msg = "Installer did not load the thermal helper. \(output.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    helperInstallState = .failed(msg)
+                    hint = msg
+                }
             }
+        } else {
+            helperInstallState = .failed("Could not start the privileged installer.")
+            hint = "Could not start the privileged installer."
         }
         DispatchQueue.main.async { self.refresh() }
     }

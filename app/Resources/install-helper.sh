@@ -86,8 +86,8 @@ rm -f /var/run/thermalguard.sock
 # because the job lives in /Library/LaunchDaemons it is started by launchd at
 # every boot without asking for a password again.
 launchctl bootout "system/${LABEL}" 2>/dev/null || true
-launchctl bootstrap system "$PLIST_DST" || true
-launchctl enable "system/${LABEL}" 2>/dev/null || true
-launchctl kickstart -k "system/${LABEL}" 2>/dev/null || true
+launchctl enable "system/${LABEL}"
+launchctl bootstrap system "$PLIST_DST"
+launchctl kickstart -k "system/${LABEL}"
 
 echo "installed"
