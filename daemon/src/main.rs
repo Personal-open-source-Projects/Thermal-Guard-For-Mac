@@ -116,7 +116,6 @@ struct Shared {
     /// User setting: reset a stuck Core Audio engine (automatic, default on).
     audio_guard: bool,
     /// Human-readable watchdog state: watching / spike / restarted / off.
-
     audio_note: String,
     /// Reset bookkeeping: total, last time, and the rolling-hour window.
     audio_restarts: u32,
@@ -377,10 +376,7 @@ fn state_json(sh: &Shared) -> String {
     json::obj(&[
         json::s("mode", sh.mode.as_str()),
         json::s("mode_label", sh.mode.label()),
-        json::s(
-            "fan_intent",
-            sh.fan_intent.as_str(),
-        ),
+        json::s("fan_intent", sh.fan_intent.as_str()),
         format!("\"fan_target\":{}", opt_num(sh.fan_target)),
         format!("\"cpu_temp\":{}", opt_num(sh.cpu_temp)),
         format!("\"fan_rpm\":{}", opt_num(sh.fan_rpm)),
@@ -409,7 +405,10 @@ fn state_json(sh: &Shared) -> String {
         json::n("memory_free_pct", (sh.mem_free_pct * 10.0).round() / 10.0),
         json::n("memory_compressed_mb", sh.mem_compressed_mb.round()),
         json::n("memory_reclaimable_mb", sh.mem_reclaimable_mb.round()),
-        json::n("memory_swap_used_pct", (sh.mem_swap_used_pct * 10.0).round() / 10.0),
+        json::n(
+            "memory_swap_used_pct",
+            (sh.mem_swap_used_pct * 10.0).round() / 10.0,
+        ),
         json::i("memory_reclaims", sh.memory_reclaims as i64),
         json::s("memory_advice", sh.memory_advice.as_str()),
         json::n(
@@ -477,8 +476,11 @@ fn probe_fan_support(smc: &Option<smc::Smc>, sh: &mut Shared, target: f64) -> Op
         None => return None,
     };
     let before = s.read_f64("F0Tg");
-    let wrote = s.write_raw("F0Tg", "fpe2", &smc::encode_fpe2(target)).is_ok()
-        || s.write_raw("F0Tg", "flt ", &smc::encode_flt(target)).is_ok();
+    let wrote = s
+        .write_raw("F0Tg", "fpe2", &smc::encode_fpe2(target))
+        .is_ok()
+        || s.write_raw("F0Tg", "flt ", &smc::encode_flt(target))
+            .is_ok();
     if !wrote {
         sh.fan_note = "SMC rejected the fan target write.".into();
         return Some(false);
@@ -616,7 +618,8 @@ fn drive_fan(smc: &Option<smc::Smc>, sh: &mut Shared, temp_c: Option<f64>) {
             let wrote = s
                 .write_raw("F0Tg", "flt ", &smc::encode_flt(target))
                 .is_ok()
-                || s.write_raw("F0Tg", "fpe2", &smc::encode_fpe2(target)).is_ok();
+                || s.write_raw("F0Tg", "fpe2", &smc::encode_fpe2(target))
+                    .is_ok();
             sh.fan_last_write = Some(Instant::now());
             if !wrote {
                 sh.fan_failed = Some(Instant::now());
@@ -769,11 +772,7 @@ fn reconcile_auto_trim(sh: &mut Shared) {
         }
     };
 
-    let grace_elapsed = !active
-        || sh
-            .trim_grace_until
-            .map(|t| now >= t)
-            .unwrap_or(true);
+    let grace_elapsed = !active || sh.trim_grace_until.map(|t| now >= t).unwrap_or(true);
     let blocked: Vec<String> = sh.trim_skip.iter().map(|(id, _)| id.clone()).collect();
     let auto_safe = apple::auto_safe_ids();
     let action = trim::plan(
@@ -792,13 +791,10 @@ fn reconcile_auto_trim(sh: &mut Shared) {
                     .trim_grace_until
                     .map(|t| t.saturating_duration_since(now).as_secs())
                     .unwrap_or(0);
-                sh.auto_trim_note =
-                    format!("Auto-trim armed; first action in {} s.", left.max(1));
+                sh.auto_trim_note = format!("Auto-trim armed; first action in {} s.", left.max(1));
             } else if active {
-                sh.auto_trim_note = format!(
-                    "{} background service(s) trimmed.",
-                    sh.auto_trimmed.len()
-                );
+                sh.auto_trim_note =
+                    format!("{} background service(s) trimmed.", sh.auto_trimmed.len());
             } else if sh.auto_trimmed.is_empty() {
                 sh.auto_trim_note = "Nothing trimmed.".into();
             }
@@ -950,11 +946,7 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
             // by label, so it cannot be steered at an arbitrary plist.
             match agents::set_enabled(&label, enable) {
                 Ok(_) => {
-                    let msg = format!(
-                        "{} {}",
-                        if enable { "enabled" } else { "disabled" },
-                        label
-                    );
+                    let msg = format!("{} {}", if enable { "enabled" } else { "disabled" }, label);
                     log_line(&msg);
                     note = msg;
                 }
@@ -977,32 +969,32 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
         let _ = stream.write_all(b"\n");
         let _ = stream.flush();
         return;
-    }        // Test-only hook: exercises the OS-level reclaim path with a stub
-        // `purge`, never the real one. Not reachable in a root install.
-        if cmd == "memory_reclaim_now" {
-            let body = if overrides_allowed() {
-                match system::purge_reclaimable() {
-                    Ok(_) => {
-                        let mut sh = shared.lock().unwrap();
-                        sh.memory_reclaims += 1;
-                        sh.memory_last = Some(Instant::now());
-                        sh.memory_window.push(Instant::now());
-                        sh.memory_note = "Reclaimable cache was released (test hook).".into();
-                        push_event(&mut sh, "memory reclaim (test hook)");
-                        state_json(&sh)
-                    }
-                    Err(e) => json::obj(&[json::s("error", &e)]),
+    } // Test-only hook: exercises the OS-level reclaim path with a stub
+      // `purge`, never the real one. Not reachable in a root install.
+    if cmd == "memory_reclaim_now" {
+        let body = if overrides_allowed() {
+            match system::purge_reclaimable() {
+                Ok(_) => {
+                    let mut sh = shared.lock().unwrap();
+                    sh.memory_reclaims += 1;
+                    sh.memory_last = Some(Instant::now());
+                    sh.memory_window.push(Instant::now());
+                    sh.memory_note = "Reclaimable cache was released (test hook).".into();
+                    push_event(&mut sh, "memory reclaim (test hook)");
+                    state_json(&sh)
                 }
-            } else {
-                json::obj(&[json::s("error", "unsupported")])
-            };
-            let _ = stream.write_all(body.as_bytes());
-            let _ = stream.write_all(b"\n");
-            let _ = stream.flush();
-            return;
-        }
+                Err(e) => json::obj(&[json::s("error", &e)]),
+            }
+        } else {
+            json::obj(&[json::s("error", "unsupported")])
+        };
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.write_all(b"\n");
+        let _ = stream.flush();
+        return;
+    }
 
-        // Test-only hook: drives the very same verified reset path with a stub
+    // Test-only hook: drives the very same verified reset path with a stub
     // `killall`, so the end-to-end test never touches the real audio stack.
     // `overrides_allowed()` is false for the installed root daemon, so this
     // command cannot exist in production.
@@ -1044,8 +1036,7 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                     sh.dirty = true;
                     if on && sh.mode != Mode::Off {
                         let grace = trim_grace_s();
-                        sh.trim_grace_until =
-                            Some(Instant::now() + Duration::from_secs(grace));
+                        sh.trim_grace_until = Some(Instant::now() + Duration::from_secs(grace));
                         sh.auto_trim_note =
                             format!("Auto-trim armed; first action in {} s.", grace);
                         push_event(&mut sh, "auto-trim armed");
@@ -1282,12 +1273,24 @@ fn main() {
                 println!("SMC opened.");
                 for k in smc::CPU_TEMP_KEYS.iter() {
                     if let Ok((tag, raw)) = s.read_raw(k) {
-                        println!("  {} [{}] = {:?} -> {:?}", k, tag, raw, smc::decode(&tag, &raw));
+                        println!(
+                            "  {} [{}] = {:?} -> {:?}",
+                            k,
+                            tag,
+                            raw,
+                            smc::decode(&tag, &raw)
+                        );
                     }
                 }
                 for k in ["F0Ac", "F0Mn", "F0Mx", "F0Tg", "F0ID"].iter() {
                     if let Ok((tag, raw)) = s.read_raw(k) {
-                        println!("  {} [{}] = {:?} -> {:?}", k, tag, raw, smc::decode(&tag, &raw));
+                        println!(
+                            "  {} [{}] = {:?} -> {:?}",
+                            k,
+                            tag,
+                            raw,
+                            smc::decode(&tag, &raw)
+                        );
                     }
                 }
             }
@@ -1482,6 +1485,14 @@ fn main() {
                 }
             }
         };
+        // Keep smoothing for the dashboard and normal threshold decisions,
+        // but never let it hide a real crossing of Auto's thermal ceiling.
+        // On a fast all-core burst, five 2-second samples can otherwise let
+        // the fan reach its loud region before the governor reacts.
+        let policy_temp = match (cpu_temp, raw_temp) {
+            (_, Some(raw)) if raw.is_finite() && raw >= 78.0 => Some(raw),
+            (smoothed, _) => smoothed,
+        };
         let fan_rpm = read_opt(&smc, "F0Ac");
         let fan_min = read_opt(&smc, "F0Mn");
         let fan_max = read_opt(&smc, "F0Mx");
@@ -1605,8 +1616,8 @@ fn main() {
             )
         };
         // Silent only costs performance where it actually buys silence. If the
-        // fans cannot be held low on this model, the earlier cap and the harder
-        // demotion that come with the preference would be a pure speed loss.
+        // fans cannot be held low on this model, its earlier cap would be a
+        // pure speed loss.
         let policy_fan = if fan_intent == FanIntent::Quiet && !fan_held {
             FanIntent::Auto
         } else {
@@ -1619,15 +1630,13 @@ fn main() {
         // The battery/charging side of the policy: latched, so a battery
         // sitting on its threshold cannot shift the cap's engage point on
         // every sample (and the shift only applies while charging on AC).
-        let battery_hot = policy::battery_heat_latched(
-            battery_temp,
-            shared.lock().unwrap().battery_hot,
-        );
+        let battery_hot =
+            policy::battery_heat_latched(battery_temp, shared.lock().unwrap().battery_hot);
         let mut decision = policy::apply_media_guard(
             policy::evaluate(
                 mode,
                 policy_fan,
-                cpu_temp,
+                policy_temp,
                 speed_limit,
                 cap_active,
                 capped_for_s,
@@ -1636,24 +1645,21 @@ fn main() {
                 ac,
             ),
             media_active && guard_on,
-            cpu_temp,
+            policy_temp,
         );
         // Stability: once released, the cap stays off for a quiet window so a
         // workload sitting on the threshold cannot toggle it every dwell. Only
         // the adaptive modes have a threshold to sit on; a mode the user chose
         // explicitly engages at once, and a chip with no usable reading is
         // never left unprotected because of a timer.
-        if !cap_active
-            && decision.cap_power
-            && matches!(mode, Mode::Auto | Mode::Balanced)
-        {
+        if !cap_active && decision.cap_power && matches!(mode, Mode::Auto | Mode::Balanced) {
             let off_for_s = uncapped_since
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(u64::MAX);
             if !policy::reengage_allowed(
                 policy::Tuning::for_mode_fan(mode, policy_fan),
                 off_for_s,
-                cpu_temp,
+                policy_temp,
             ) {
                 decision.cap_power = false;
             }
@@ -1667,46 +1673,46 @@ fn main() {
                 .unwrap_or(false);
             if !backing_off {
                 match system::set_low_power_mode(decision.cap_power) {
-                Ok(_) => {
-                    cap_failed = None;
-                    capped_since = if decision.cap_power {
-                        Some(Instant::now())
-                    } else {
-                        None
-                    };
-                    uncapped_since = if decision.cap_power {
-                        None
-                    } else {
-                        Some(Instant::now())
-                    };
-                    let mut sh = shared.lock().unwrap();
-                    sh.cap_active = decision.cap_power;
-                    // Persist at once: a crash between the `pmset` write and the
-                    // periodic state write would otherwise lose the fact that
-                    // the machine is capped.
-                    sh.dirty = true;
-                    if decision.cap_power {
-                        let msg = format!(
-                            "power cap ON (turbo ratio {} -> {})",
-                            sh.soft_ratio.unwrap_or(0),
-                            sh.lpm_ratio.unwrap_or(0)
-                        );
-                        push_event(&mut sh, &msg);
-                    } else {
-                        push_event(&mut sh, "power cap OFF (full turbo available)");
-                    }
-                    logged_cap = false;
-                }
-                Err(e) => {
-                    // Back off, or a machine that refuses the write would spawn
-                    // `pmset` on every 2 s tick for the life of the process.
-                    cap_failed = Some(Instant::now());
-                    if !logged_cap {
+                    Ok(_) => {
+                        cap_failed = None;
+                        capped_since = if decision.cap_power {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
+                        uncapped_since = if decision.cap_power {
+                            None
+                        } else {
+                            Some(Instant::now())
+                        };
                         let mut sh = shared.lock().unwrap();
-                        push_event(&mut sh, &format!("power cap change failed: {}", e));
-                        logged_cap = true;
+                        sh.cap_active = decision.cap_power;
+                        // Persist at once: a crash between the `pmset` write and the
+                        // periodic state write would otherwise lose the fact that
+                        // the machine is capped.
+                        sh.dirty = true;
+                        if decision.cap_power {
+                            let msg = format!(
+                                "power cap ON (turbo ratio {} -> {})",
+                                sh.soft_ratio.unwrap_or(0),
+                                sh.lpm_ratio.unwrap_or(0)
+                            );
+                            push_event(&mut sh, &msg);
+                        } else {
+                            push_event(&mut sh, "power cap OFF (full turbo available)");
+                        }
+                        logged_cap = false;
                     }
-                }
+                    Err(e) => {
+                        // Back off, or a machine that refuses the write would spawn
+                        // `pmset` on every 2 s tick for the life of the process.
+                        cap_failed = Some(Instant::now());
+                        if !logged_cap {
+                            let mut sh = shared.lock().unwrap();
+                            push_event(&mut sh, &format!("power cap change failed: {}", e));
+                            logged_cap = true;
+                        }
+                    }
                 }
             }
         }
@@ -1767,10 +1773,7 @@ fn main() {
                     sh.audio_restarts_window.push(Instant::now());
                     sh.audio_streak = 0;
                     sh.audio_note = note;
-                    push_event(
-                        &mut sh,
-                        "core audio engine reset after a sustained spike",
-                    );
+                    push_event(&mut sh, "core audio engine reset after a sustained spike");
                 }
                 Err(e) => {
                     let mut sh = shared.lock().unwrap();
@@ -1797,8 +1800,12 @@ fn main() {
                 } else {
                     0.0
                 };
-                sh.mem_pressure =
-                    memory::pressure_level(m.kernel_pressure, free_pct, m.swap_used_pct, compressed_pct);
+                sh.mem_pressure = memory::pressure_level(
+                    m.kernel_pressure,
+                    free_pct,
+                    m.swap_used_pct,
+                    compressed_pct,
+                );
                 sh.mem_free_pct = free_pct;
                 sh.mem_compressed_mb = m.compressed_mb;
                 sh.mem_reclaimable_mb = m.reclaimable_mb;
@@ -1806,11 +1813,8 @@ fn main() {
             }
             sh.memory_window.retain(|t| t.elapsed().as_secs() < 3600);
             sh.memory_trend = mem_trend;
-            sh.memory_advice = memory::advice(
-                sh.mem_pressure,
-                sh.mem_reclaimable_mb,
-                sh.mem_swap_used_pct,
-            );
+            sh.memory_advice =
+                memory::advice(sh.mem_pressure, sh.mem_reclaimable_mb, sh.mem_swap_used_pct);
             let inputs = memory::Inputs {
                 enabled: sh.memory_reclaim,
                 mode_off: sh.mode == Mode::Off,

@@ -118,12 +118,14 @@ pub struct Trend {
 }
 
 /// `samples` is `(elapsed_seconds, compressed_mb, swap_used_mb)`, oldest first.
+/// Callers may use either a forward clock or an age (where the oldest sample
+/// has the largest number), so only the magnitude of the elapsed delta matters.
 pub fn trend(samples: &[(f64, f64, f64)], window_s: f64) -> Trend {
     let (first, last) = match (samples.first(), samples.last()) {
         (Some(a), Some(b)) => (a, b),
         _ => return Trend::default(),
     };
-    let dt = (last.0 - first.0).min(window_s);
+    let dt = (last.0 - first.0).abs().min(window_s);
     if dt <= 0.0 {
         return Trend::default();
     }
@@ -244,10 +246,7 @@ mod tests {
     #[test]
     fn advice_reclaims_before_asking_anyone_to_quit() {
         assert_eq!(advice(Pressure::Normal, 4096.0, 0.0), Advice::Hold);
-        assert_eq!(
-            advice(Pressure::High, 4096.0, 10.0),
-            Advice::ReclaimCache
-        );
+        assert_eq!(advice(Pressure::High, 4096.0, 10.0), Advice::ReclaimCache);
         // Nothing reclaimable, or swap is already thrashing: apps are the lever.
         assert_eq!(advice(Pressure::High, 512.0, 10.0), Advice::TrimApps);
         assert_eq!(
@@ -265,9 +264,18 @@ mod tests {
         let falling = trend(&[(0.0, 300.0, 150.0), (10.0, 100.0, 50.0)], 20.0);
         assert_eq!(falling, Trend::default());
 
+        // The daemon supplies sample ages, so its oldest sample has the
+        // largest timestamp. That ordering must still expose growth.
+        let aged = trend(&[(10.0, 100.0, 50.0), (0.0, 300.0, 150.0)], 20.0);
+        assert!((aged.compressed_mb_per_s - 20.0).abs() < 1e-9);
+        assert!((aged.swap_mb_per_s - 10.0).abs() < 1e-9);
+
         // One sample, or a zero window, is not a trend.
         assert_eq!(trend(&[(0.0, 100.0, 50.0)], 20.0), Trend::default());
-        assert_eq!(trend(&[(0.0, 1.0, 1.0), (5.0, 9.0, 9.0)], 0.0), Trend::default());
+        assert_eq!(
+            trend(&[(0.0, 1.0, 1.0), (5.0, 9.0, 9.0)], 0.0),
+            Trend::default()
+        );
     }
 
     #[test]

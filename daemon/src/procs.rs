@@ -297,7 +297,11 @@ mod tests {
         ] {
             assert!(is_media(call), "{} should count as a call/media session", call);
         }
-        for other in ["/usr/bin/node", "/Applications/Xcode.app/Contents/MacOS/Xcode", "/bin/ps"] {
+        for other in [
+            "/usr/bin/node",
+            "/Applications/Xcode.app/Contents/MacOS/Xcode",
+            "/bin/ps",
+        ] {
             assert!(!is_media(other), "{} is not a media session", other);
         }
     }
@@ -352,7 +356,12 @@ mod tests {
         let nasty = format!("/Users/x/{}", "é".repeat(80));
         let out = short_name(&nasty);
         assert!(out.chars().count() <= 34);
-        assert!(short_name("日本語のプロセス名がとても長い場合のテストです").chars().count() <= 34);
+        assert!(
+            short_name("日本語のプロセス名がとても長い場合のテストです")
+                .chars()
+                .count()
+                <= 34
+        );
     }
 
     #[test]

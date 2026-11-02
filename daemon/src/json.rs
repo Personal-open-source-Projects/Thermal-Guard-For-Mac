@@ -41,10 +41,7 @@ pub fn obj(pairs: &[String]) -> String {
 
 /// A JSON array of strings, escaped for the wire/state file.
 pub fn str_array(key: &str, vals: &[String]) -> String {
-    let items: Vec<String> = vals
-        .iter()
-        .map(|v| format!("\"{}\"", esc(v)))
-        .collect();
+    let items: Vec<String> = vals.iter().map(|v| format!("\"{}\"", esc(v))).collect();
     format!("\"{}\":[{}]", esc(key), items.join(","))
 }
 
@@ -99,10 +96,7 @@ pub fn get_bool(src: &str, key: &str) -> Option<bool> {
 pub fn get_str_array(src: &str, key: &str) -> Option<Vec<String>> {
     let pat = format!("\"{}\"", key);
     let start = src.find(&pat)? + pat.len();
-    let rest = src[start..]
-        .trim_start()
-        .strip_prefix(':')?
-        .trim_start();
+    let rest = src[start..].trim_start().strip_prefix(':')?.trim_start();
     if !rest.starts_with('[') {
         return None;
     }
@@ -184,7 +178,9 @@ pub fn get_num(src: &str, key: &str) -> Option<f64> {
     let start = src.find(&pat)? + pat.len();
     let rest = src[start..].trim_start().strip_prefix(':')?.trim_start();
     let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E'))
+        .find(|c: char| {
+            !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')
+        })
         .unwrap_or(rest.len());
     rest[..end].parse::<f64>().ok()
 }
@@ -211,11 +207,7 @@ mod tests {
 
     #[test]
     fn reads_numbers_and_bools() {
-        let body = obj(&[
-            json_num(),
-            b("flag", true),
-            s("mode", "balanced"),
-        ]);
+        let body = obj(&[json_num(), b("flag", true), s("mode", "balanced")]);
         assert_eq!(get_num(&body, "cpu_temp"), Some(71.5));
         assert!(body.contains("\"flag\":true"));
         assert_eq!(get_str(&body, "mode").unwrap(), "balanced");
@@ -246,7 +238,10 @@ mod tests {
         let body = obj(&[str_array("auto_trimmed", &vals)]);
         assert_eq!(get_str_array(&body, "auto_trimmed").unwrap(), vals);
 
-        assert_eq!(get_str_array("{\"auto_trimmed\":[]}", "auto_trimmed").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            get_str_array("{\"auto_trimmed\":[]}", "auto_trimmed").unwrap(),
+            Vec::<String>::new()
+        );
         assert!(get_str_array("{\"auto_trimmed\":[1,2]}", "auto_trimmed").is_none());
         assert!(get_str_array("{\"auto_trimmed\":\"nope\"}", "auto_trimmed").is_none());
         assert!(get_str_array("{\"other\":[]}", "auto_trimmed").is_none());

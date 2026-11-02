@@ -93,9 +93,7 @@ fn fourcc(key: &str) -> Option<u32> {
     if b.len() != 4 {
         return None;
     }
-    Some(
-        ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32),
-    )
+    Some(((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32))
 }
 
 fn u32_to_fourcc(v: u32) -> String {

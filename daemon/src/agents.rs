@@ -38,7 +38,10 @@ pub fn path_allowed(p: &str) -> bool {
 }
 
 fn label_of(plist_path: &str) -> Option<String> {
-    let label = run("/usr/bin/plutil", &["-extract", "Label", "raw", "-o", "-", plist_path]);
+    let label = run(
+        "/usr/bin/plutil",
+        &["-extract", "Label", "raw", "-o", "-", plist_path],
+    );
     if !label.is_empty() && !label.contains("Could not") {
         return Some(label);
     }
@@ -48,7 +51,10 @@ fn label_of(plist_path: &str) -> Option<String> {
 
 fn is_loaded(scope: &str, label: &str) -> bool {
     let domain = domain_for(scope);
-    let out = run("/bin/launchctl", &["print", &format!("{}/{}", domain, label)]);
+    let out = run(
+        "/bin/launchctl",
+        &["print", &format!("{}/{}", domain, label)],
+    );
     !out.is_empty() && !out.contains("Could not find service")
 }
 
@@ -97,7 +103,12 @@ pub fn scan() -> Vec<Item> {
                 continue;
             }
             let loaded = is_loaded(scope, &label);
-            items.push(Item { label, path: p, scope: scope.to_string(), loaded });
+            items.push(Item {
+                label,
+                path: p,
+                scope: scope.to_string(),
+                loaded,
+            });
         }
     }
     items.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
@@ -128,7 +139,10 @@ pub fn set_enabled(label: &str, enable: bool) -> Result<(), String> {
     let out = if enable {
         run("/bin/launchctl", &["bootstrap", &domain, &item.path])
     } else {
-        run("/bin/launchctl", &["bootout", &format!("{}/{}", domain, label)])
+        run(
+            "/bin/launchctl",
+            &["bootout", &format!("{}/{}", domain, label)],
+        )
     };
     if out.to_lowercase().contains("error") || out.contains("failed") {
         return Err(out);
@@ -157,8 +171,12 @@ mod tests {
 
     #[test]
     fn only_launchd_locations_are_bootstrappable() {
-        assert!(path_allowed("/Library/LaunchDaemons/com.wacom.UpdateHelper.plist"));
-        assert!(path_allowed("/Library/LaunchAgents/com.wacom.IOManager.plist"));
+        assert!(path_allowed(
+            "/Library/LaunchDaemons/com.wacom.UpdateHelper.plist"
+        ));
+        assert!(path_allowed(
+            "/Library/LaunchAgents/com.wacom.IOManager.plist"
+        ));
         assert!(path_allowed("/Users/admin/Library/LaunchAgents/x.plist"));
     }
 

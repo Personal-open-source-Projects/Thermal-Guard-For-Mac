@@ -110,10 +110,16 @@ pub fn xcpm_ratios() -> (Option<u32>, Option<u32>) {
     let mut soft = None;
     let mut lpm = None;
     for line in text.lines() {
-        if let Some(v) = line.split("machdep.xcpm.soft_plimit_max_100mhz_ratio:").nth(1) {
+        if let Some(v) = line
+            .split("machdep.xcpm.soft_plimit_max_100mhz_ratio:")
+            .nth(1)
+        {
             soft = v.trim().parse::<u32>().ok();
         }
-        if let Some(v) = line.split("machdep.xcpm.lpm_plimit_max_100mhz_ratio:").nth(1) {
+        if let Some(v) = line
+            .split("machdep.xcpm.lpm_plimit_max_100mhz_ratio:")
+            .nth(1)
+        {
             lpm = v.trim().parse::<u32>().ok();
         }
     }
@@ -136,7 +142,6 @@ pub fn battery_temp() -> Option<f64> {
     }
     None
 }
-
 
 pub fn on_ac_power() -> bool {
     run(PMSET, &["-g", "batt"])
@@ -380,7 +385,10 @@ fn killall_path() -> String {
 
 /// PID of the Core Audio engine, used only to report whether it came back.
 pub fn coreaudiod_pid() -> Option<u32> {
-    let out = Command::new(PGREP).args(["-x", "coreaudiod"]).output().ok()?;
+    let out = Command::new(PGREP)
+        .args(["-x", "coreaudiod"])
+        .output()
+        .ok()?;
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()?
@@ -456,12 +464,14 @@ fn ping_gateway(gateway: &str) -> (Option<f64>, f64) {
     let loss = out
         .lines()
         .find(|l| l.contains("packet loss"))
-        .and_then(|l| number_before(l, "").or_else(|| {
-            l.split('%')
-                .next()
-                .and_then(|p| p.split_whitespace().last())
-                .and_then(|v| v.parse::<f64>().ok())
-        }))
+        .and_then(|l| {
+            number_before(l, "").or_else(|| {
+                l.split('%')
+                    .next()
+                    .and_then(|p| p.split_whitespace().last())
+                    .and_then(|v| v.parse::<f64>().ok())
+            })
+        })
         .unwrap_or(0.0);
     let rtt = out
         .lines()
@@ -500,8 +510,7 @@ pub fn network_probe() -> Option<NetProbe> {
     }
 
     let wifi_text = run(WDUTIL, &["info"]).unwrap_or_default();
-    let associated = wifi_text.contains("Link Status: Associated")
-        || wifi_text.contains("RSSI");
+    let associated = wifi_text.contains("Link Status: Associated") || wifi_text.contains("RSSI");
     let link = if associated {
         crate::net::Link::Wifi
     } else {

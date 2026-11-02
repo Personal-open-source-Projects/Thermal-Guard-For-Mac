@@ -28,10 +28,7 @@ pub enum Action {
 }
 
 fn enabled(states: &[(String, bool)], id: &str) -> Option<bool> {
-    states
-        .iter()
-        .find(|(sid, _)| sid == id)
-        .map(|(_, on)| *on)
+    states.iter().find(|(sid, _)| sid == id).map(|(_, on)| *on)
 }
 
 fn is_auto_safe(auto_safe: &[&str], id: &str) -> bool {
@@ -221,7 +218,10 @@ mod tests {
 
     #[test]
     fn unreadable_launchd_state_means_no_action() {
-        assert_eq!(plan(false, None, &["com.test.a".into()], SAFE, true, &[]), Action::None);
+        assert_eq!(
+            plan(false, None, &["com.test.a".into()], SAFE, true, &[]),
+            Action::None
+        );
         assert_eq!(plan(true, None, &[], SAFE, true, &[]), Action::None);
     }
 
@@ -237,6 +237,9 @@ mod tests {
             "com.test.b".to_string(),
             "com.test.c".to_string(),
         ];
-        assert_eq!(plan(true, Some(&s), &tracked, SAFE, true, &[]), Action::None);
+        assert_eq!(
+            plan(true, Some(&s), &tracked, SAFE, true, &[]),
+            Action::None
+        );
     }
 }

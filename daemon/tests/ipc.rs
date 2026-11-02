@@ -54,13 +54,7 @@ fn unique_dir(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!(
-        "{}-{}-{}-{}",
-        prefix,
-        std::process::id(),
-        n,
-        stamp
-    ))
+    std::env::temp_dir().join(format!("{}-{}-{}-{}", prefix, std::process::id(), n, stamp))
 }
 
 fn start_in(dir: PathBuf, envs: &[(&str, String)]) -> Guard {
@@ -236,7 +230,11 @@ fn fan_preference_round_trips_through_the_daemon() {
 fn video_and_call_shield_is_on_by_default_and_togglable() {
     let g = start();
     let r = ask(&g, "{\"cmd\":\"status\"}");
-    assert!(r.contains("\"media_guard\":true"), "shield must default on: {}", r);
+    assert!(
+        r.contains("\"media_guard\":true"),
+        "shield must default on: {}",
+        r
+    );
 
     let _ = ask(&g, "{\"cmd\":\"media_guard\",\"value\":\"off\"}");
     let r = ask(&g, "{\"cmd\":\"status\"}");
@@ -264,8 +262,16 @@ fn a_client_cannot_choose_an_arbitrary_fan_rpm() {
     );
     let reply = ask(&g, "{\"cmd\":\"status\"}");
     assert!(reply.contains("\"fan_intent\":\"quiet\""), "got {}", reply);
-    assert!(!reply.contains("999999"), "caller RPM leaked into state: {}", reply);
-    assert!(!reply.contains("-1.0"), "caller target leaked into state: {}", reply);
+    assert!(
+        !reply.contains("999999"),
+        "caller RPM leaked into state: {}",
+        reply
+    );
+    assert!(
+        !reply.contains("-1.0"),
+        "caller target leaked into state: {}",
+        reply
+    );
 }
 
 #[test]
@@ -300,7 +306,10 @@ fn third_party_list_excludes_apple_and_itself() {
     let g = start();
     let reply = ask(&g, "{\"cmd\":\"agents\"}");
     assert!(reply.contains("\"items\""), "got {}", reply);
-    assert!(!reply.contains("\"label\":\"com.apple."), "Apple items leaked");
+    assert!(
+        !reply.contains("\"label\":\"com.apple."),
+        "Apple items leaked"
+    );
     assert!(!reply.contains("com.thermalguard.daemon"), "self leaked");
 }
 
@@ -487,7 +496,11 @@ fn fake_killall() -> (PathBuf, PathBuf) {
 fn audio_watchdog_is_on_by_default_and_togglable() {
     let g = start();
     let r = ask(&g, "{\"cmd\":\"status\"}");
-    assert!(r.contains("\"audio_guard\":true"), "watchdog must default on: {}", r);
+    assert!(
+        r.contains("\"audio_guard\":true"),
+        "watchdog must default on: {}",
+        r
+    );
     assert!(r.contains("\"audio_state\""), "state missing: {}", r);
     assert!(r.contains("\"audio_restarts\":0"), "counter missing: {}", r);
 
@@ -509,7 +522,10 @@ fn audio_watchdog_is_on_by_default_and_togglable() {
 fn audio_reset_path_uses_sigterm_and_is_verified() {
     let (script, log) = fake_killall();
     let g = start_with_env(&[
-        ("THERMALGUARD_KILLALL", script.to_string_lossy().into_owned()),
+        (
+            "THERMALGUARD_KILLALL",
+            script.to_string_lossy().into_owned(),
+        ),
         ("FAKE_KILLALL_LOG", log.to_string_lossy().into_owned()),
     ]);
 
@@ -530,7 +546,12 @@ fn audio_reset_path_uses_sigterm_and_is_verified() {
         "expected one graceful SIGTERM, got {:?}",
         calls
     );
-    assert_eq!(calls.lines().count(), 1, "more than one signal: {:?}", calls);
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "more than one signal: {:?}",
+        calls
+    );
     let _ = std::fs::remove_dir_all(script.parent().unwrap());
 }
 
@@ -606,7 +627,11 @@ fn auto_trim_is_on_by_default_strictly_boolean_and_restores_on_disable() {
         "active in every mode except Off: {}",
         r
     );
-    assert!(r.contains("\"auto_trimmed\":[]"), "nothing tracked yet: {}", r);
+    assert!(
+        r.contains("\"auto_trimmed\":[]"),
+        "nothing tracked yet: {}",
+        r
+    );
 
     // A string is not a boolean: it must not disarm the trimmer.
     let _ = ask(&g, "{\"cmd\":\"auto_trim\",\"value\":\"yes\"}");
@@ -634,7 +659,9 @@ fn auto_trim_is_on_by_default_strictly_boolean_and_restores_on_disable() {
         disabled
     );
     assert!(
-        disabled.lines().all(|l| !l.contains("WindowServer") && !l.contains("securityd")),
+        disabled
+            .lines()
+            .all(|l| !l.contains("WindowServer") && !l.contains("securityd")),
         "a protected service was touched: {}",
         disabled
     );
@@ -708,11 +735,20 @@ fn mode_change_is_persisted_immediately_and_off_is_reported_at_once() {
 fn network_health_is_reported_read_only() {
     let g = start();
     let r = ask(&g, "{\"cmd\":\"status\"}");
-    for key in ["\"net_link\"", "\"net_score\"", "\"net_grade\"", "\"net_note\""] {
+    for key in [
+        "\"net_link\"",
+        "\"net_score\"",
+        "\"net_grade\"",
+        "\"net_note\"",
+    ] {
         assert!(r.contains(key), "missing {} in {}", key, r);
     }
     // No silent network writes: there is no tuning state to report.
-    assert!(!r.contains("\"net_tuned\""), "daemon must never rewrite the link: {}", r);
+    assert!(
+        !r.contains("\"net_tuned\""),
+        "daemon must never rewrite the link: {}",
+        r
+    );
 }
 
 #[test]
@@ -845,7 +881,10 @@ fn power_cap_turns_on_with_a_cooling_mode_and_off_again() {
     // Held, not toggled: with the fake pmset in front of us the cap must stay
     // on across several control-loop ticks.
     for _ in 0..4 {
-        assert!(cap_on(&g), "the cap dropped out while Max Cool was selected");
+        assert!(
+            cap_on(&g),
+            "the cap dropped out while Max Cool was selected"
+        );
         std::thread::sleep(Duration::from_millis(700));
     }
 
@@ -862,7 +901,11 @@ fn power_cap_turns_on_with_a_cooling_mode_and_off_again() {
         .lines()
         .filter(|l| l.starts_with("-a lowpowermode"))
         .count();
-    assert_eq!(writes, 2, "expected exactly one on and one off, got {:?}", calls);
+    assert_eq!(
+        writes, 2,
+        "expected exactly one on and one off, got {:?}",
+        calls
+    );
 }
 
 #[test]
@@ -924,7 +967,8 @@ fn process_sample_does_not_flicker_between_ticks() {
     // every other tick.
     let g = start();
     assert!(
-        wait_until(10, || !ask(&g, "{\"cmd\":\"status\"}").contains("\"procs\":[]")),
+        wait_until(10, || !ask(&g, "{\"cmd\":\"status\"}")
+            .contains("\"procs\":[]")),
         "the daemon never sampled processes"
     );
     for _ in 0..8 {
@@ -937,4 +981,3 @@ fn process_sample_does_not_flicker_between_ticks() {
         std::thread::sleep(Duration::from_millis(500));
     }
 }
-

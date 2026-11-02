@@ -106,7 +106,7 @@ Reinstalling macOS does not change #1 or #2 — they are design, not corruption.
 
 | Mode | Power cap | Demote threshold |
 |------|-----------|------------------|
-| **Auto** (default) | only above 78 °C (or when macOS starts throttling), released below 74 °C with 20 s of hysteresis | ≥ 80 % CPU |
+| **Auto** (default) | only above 78 °C (or when macOS starts throttling), released below 74 °C with 20 s of hysteresis | never — preserves foreground responsiveness |
 | Off | never | – |
 | Balanced | above 82 °C, release at 72 °C | ≥ 70 % CPU |
 | Cool & Quiet | always | ≥ 45 % CPU |
@@ -383,7 +383,8 @@ Invariants the code and tests enforce:
   a machine whose `CPU_Speed_Limit` stays below 100 cannot deadlock capped.
 - **Every transition has a dwell time** (20 s Auto, 10 s Balanced) measured
   from when the cap engaged, so a stray sample cannot flap turbo on and off.
-- **Silent fan shifts the thresholds earlier** (−6 °C, −10 % demote bar) rather
+- **Silent fan shifts the thresholds earlier** (−6 °C, and a lower demote bar
+  in explicit cooling modes) rather
   than overriding safety, and is handed back to the SMC above 88 °C.
 - **Media guard relaxes only the extra clamping** — never the safety limit —
   and only on a known temperature below 84 °C.

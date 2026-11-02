@@ -429,12 +429,7 @@ pub fn service_states() -> Option<Vec<(String, bool)>> {
     Some(
         SERVICES
             .iter()
-            .map(|s| {
-                (
-                    s.id.to_string(),
-                    !disabled.iter().any(|d| d == s.id),
-                )
-            })
+            .map(|s| (s.id.to_string(), !disabled.iter().any(|d| d == s.id)))
             .collect(),
     )
 }
@@ -493,14 +488,23 @@ pub fn set(id: &str, enable: bool) -> Result<String, String> {
     }
     match id {
         "spotlight" => {
-            let out = run("/usr/bin/mdutil", &["-a", "-i", if enable { "on" } else { "off" }]);
+            let out = run(
+                "/usr/bin/mdutil",
+                &["-a", "-i", if enable { "on" } else { "off" }],
+            );
             if out.contains("Error") || out.contains("failed") {
                 return Err(out);
             }
-            Ok(format!("Spotlight indexing {}", if enable { "on" } else { "off" }))
+            Ok(format!(
+                "Spotlight indexing {}",
+                if enable { "on" } else { "off" }
+            ))
         }
         "powernap" => {
-            let out = run("/usr/bin/pmset", &["-a", "powernap", if enable { "1" } else { "0" }]);
+            let out = run(
+                "/usr/bin/pmset",
+                &["-a", "powernap", if enable { "1" } else { "0" }],
+            );
             if out.to_lowercase().contains("error") {
                 return Err(out);
             }
@@ -519,7 +523,11 @@ pub fn set(id: &str, enable: bool) -> Result<String, String> {
             if disabled_set().iter().any(|d| d == label) == enable {
                 return Err(format!("{} refused (SIP-protected). {}", label, out.trim()));
             }
-            Ok(format!("{} {}", label, if enable { "enabled" } else { "disabled" }))
+            Ok(format!(
+                "{} {}",
+                label,
+                if enable { "enabled" } else { "disabled" }
+            ))
         }
     }
 }
