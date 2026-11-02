@@ -11,6 +11,17 @@ import VideoToolbox
 let SOCK_PATH = "/var/run/thermalguard.sock"
 let HELPER_LABEL = "com.thermalguard.daemon"
 
+/// Clean separation: helper installation is tracked independently from whether
+/// the daemon answers its socket, so a transient startup delay never triggers
+/// an unnecessary re-install prompt.
+enum HelperInstallState: Equatable {
+    case unknown
+    case notInstalled
+    case installing
+    case installed
+    case failed(String)
+}
+
 // MARK: - IPC with the privileged daemon
 
 func sendRequest(_ payload: String) -> String? {
@@ -1515,7 +1526,7 @@ struct RootView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 12))
                     .foregroundStyle(.orange)
-                Text("Install the thermal helper to begin")
+                Text(d.helperInstallState == .installing ? "Installing thermal helper…" : "Install the thermal helper to begin")
                     .font(.system(size: 12, weight: .semibold))
             }
             Text("One privileged install. It reads the SMC thermometer and applies the power cap; nothing else on this Mac is touched.")
@@ -1527,13 +1538,20 @@ struct RootView: View {
                     .font(.system(size: 10.5))
                     .foregroundStyle(.orange)
             }
-            Button {
-                d.installHelper()
-            } label: {
-                Text("Install Thermal Helper…").frame(maxWidth: .infinity)
+            if d.helperInstallState == .installing {
+                Text("Installing thermal helper — enter your Mac password when prompted.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Button {
+                    d.installHelper()
+                } label: {
+                    Text("Install Thermal Helper…").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.regular)
         }
         .cardSurface()
     }
@@ -2153,6 +2171,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     // Live machine state, published straight into SwiftUI.
     @Published var helperRunning = false
     @Published var helperPresent = false
+    @Published var helperInstallState: HelperInstallState = .unknown
+    private let helperAutoInstallAttemptedKey = "helperAutoInstallAttempted"
     @Published var loginOn = false
     @Published var temp: Double?
     @Published var fan: Double?
@@ -2317,6 +2337,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         buildWindow()
         refresh()
         showPanel()
+        // Auto-install the privileged helper once on first launch, and ensure
+        // the app starts at login so thermal protection is active after every
+        // restart without repeated admin prompts.
+        if !helperRunning, !UserDefaults.standard.bool(forKey: helperAutoInstallAttemptedKey) {
+            UserDefaults.standard.set(true, forKey: helperAutoInstallAttemptedKey)
+            attemptAutoInstall()
+        }
+        if !loginOn {
+            setLogin(true)
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
@@ -2857,11 +2887,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    func attemptAutoInstall() {
+        guard !UserDefaults.standard.bool(forKey: helperAutoInstallAttemptedKey) else { return }
+        UserDefaults.standard.set(true, forKey: helperAutoInstallAttemptedKey)
+        performHelperInstall()
+    }
+
     func installHelper() {
+        performHelperInstall()
+    }
+
+    private func performHelperInstall() {
         guard let script = Bundle.main.path(forResource: "install-helper", ofType: "sh") else {
+            helperInstallState = .failed("install-helper.sh missing from the app bundle.")
             hint = "install-helper.sh missing from the app bundle."
             return
         }
+        helperInstallState = .installing
         let cmd = "/bin/sh \(shellQuote(script)) \(shellQuote(Bundle.main.bundlePath))"
         let escaped = cmd.replacingOccurrences(of: "\\", with: "\\\\")
                            .replacingOccurrences(of: "\"", with: "\\\"")
@@ -2870,12 +2912,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         if let apple = NSAppleScript(source: source) {
             apple.executeAndReturnError(&err)
             if let e = err {
-                hint = "Installer error: \(e[NSAppleScript.errorMessage] ?? "unknown")"
+                let msg = "Installer error: \(e[NSAppleScript.errorMessage] ?? "unknown")"
+                helperInstallState = .failed(msg)
+                hint = msg
             } else {
+                helperInstallState = .installed
                 hint = "Helper installed. Thermal protection is active."
             }
         }
-        refresh()
+        DispatchQueue.main.async { self.refresh() }
     }
 
     // MARK: login item
