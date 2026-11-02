@@ -1417,6 +1417,7 @@ fn main() {
     // Short ring of Mach samples used for the compressor/swap trend.
     let mut mem_samples: Vec<(Instant, f64, f64)> = Vec::new();
     let mut last_net_scan = Instant::now() - Duration::from_secs(30);
+    let mut last_trim_scan = Instant::now() - Duration::from_secs(15);
     let mut logged_cap = false;
     // The last process sample survives between scans (see the sampling block),
     // and the media shield stays up for a short hold after the last busy one.
@@ -1879,8 +1880,12 @@ fn main() {
 
             drive_fan(&smc, &mut sh, cpu_temp);
 
-            // Opt-in Auto-mode trimmer: at most one verified change per tick.
-            reconcile_auto_trim(&mut sh);
+            // Auto-mode trimmer: checks every 15 s, at most one safe change
+            // per check, so OS/non-OS services are never impacted together.
+            if last_trim_scan.elapsed() >= Duration::from_secs(15) {
+                last_trim_scan = Instant::now();
+                reconcile_auto_trim(&mut sh);
+            }
 
             if let Some(n) = net.as_ref() {
                 let report = net::evaluate(&net::Inputs {
