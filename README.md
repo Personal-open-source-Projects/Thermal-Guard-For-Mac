@@ -56,21 +56,46 @@ Reinstalling macOS does not change #1 or #2 — they are design, not corruption.
   leftover helper processes are sent SIGTERM only after their executable path is
   re-verified. Everything is restored when Chrome is used again or the toggle
   is turned off.
-- Graceful memory guard (default on, every mode except Off): under real memory
-  pressure, idle user apps with no window and 10 minutes (5 at critical
-  pressure) of inactivity are asked to quit gracefully. Nothing is force-killed
-  and protected, frontmost, audio, camera or busy apps are never candidates.
-  Before any app is touched the daemon measures the compressor, swap and the
-  reclaimable (purgeable + file-backed) cache, and it takes its pressure band
-  from the kernel's own verdict (`kern.memorystatus_vm_pressure_level`) rather
-  than a free-page percentage — macOS keeps free pages low on purpose. Sampling
-  goes through Mach directly (`host_statistics64` + `sysctlbyname`, no
-  `vm_stat`/`sysctl` children) and costs ~15 µs, so it runs on every 2 s tick.
-  The compressor/swap **trend** is tracked over a 20 s window, so a machine
-  climbing into pressure is visible before it is critical. The ladder is:
-  kernel compresses and swaps → drop cache we can prove is reclaimable (≥ 1 GB,
-  swap < 70 %, 30-minute cooldown, twice an hour, never in Off mode) → only then
-  ask idle apps to quit.
+- Thermal-aware RAM governor (default on, every mode except Off): memory pressure
+  is treated as a **heat** problem, not just a latency problem, because
+  compressor churn and swap-in are CPU and disk work that turns straight into
+  die temperature. The daemon measures the kernel's own counters
+  (`compressions`, `decompressions`, `swapins`, `swapouts`) every 2 s and turns
+  them into a churn rate, then walks an explicit ladder:
+  *drop reclaimable cache → ask idle apps to quit* — and stops at the first rung
+  that is both safe and justified. Nothing is force-killed.
+  - **Cache first, always.** A purge is one bounded disk burst with no
+    user-visible loss. Under pressure it goes before any app is touched, and it
+    also runs *pre-emptively* when the compressor is climbing (200 pages/s, or
+    +8 MB/s) while the chip still has headroom, because cheap I/O done early
+    replaces expensive churn done late.
+  - **Heat is a veto, not a trigger.** At ≥ 85 °C a purge is deferred unless
+    pressure is critical or the compressor is already burning more CPU than the
+    purge would — an extra I/O burst on a saturated chassis is not "help".
+    A hot chip does not get an idle app quit for free either: it must be
+    *churning* as well, so a hot machine with quiet memory is left alone.
+  - **A futile purge demotes itself.** The result is measured (`freed MB`); if
+    it freed under 128 MB it is not repeated for 15 minutes, and the ladder
+    escalates to an app instead of burning the same I/O twice.
+  - **Per-mode tolerances.** Auto and Balanced wait for critical pressure or a
+    genuinely hot, churning chip. Cool & Quiet and Max Cool act at high
+    pressure, treat a merely warm chip as enough, and get a shorter purge
+    cooldown (15 min / 7.5 min) with a slightly larger hourly cap — still
+    bounded, so the daemon can never purge in a loop.
+  - **One decision, one executor.** The daemon publishes the rung
+    (`memory_plan`), its reason (`memory_plan_reason`) and a sentence for the UI
+    (`memory_plan_detail`). The unprivileged UI only executes the surviving
+    `trim` rung; it no longer re-derives pressure from its own `vm_stat` fork,
+    which removes a child process from the 15 s guard tick.
+  - **"Free" means available, not idle.** The card reports free plus reclaimable
+    (purgeable and file-backed) memory — what the kernel can hand out without
+    swapping. Raw free pages sit near zero on a healthy Mac by design, which is
+    what made the old card read 1 % and "unreadable"; the daemon publishes the
+    available figure and the UI no longer computes a second one.
+  - Sampling is Mach-only (`host_statistics64` + `sysctlbyname`, no `vm_stat`
+    or `sysctl` children) and costs tens of microseconds, so it runs on every
+    2 s tick. The compressor/swap **trend** is tracked over a 20 s window, so a
+    machine climbing into pressure is visible before it is critical.
 - **Reduced animations & visual effects** (default on, every mode except Off):
   writes the three macOS switches that cost the Intel Iris Plus the most —
   Reduce Motion, Reduce Transparency and automatic window animations — and puts
@@ -104,13 +129,18 @@ Reinstalling macOS does not change #1 or #2 — they are design, not corruption.
 
 ### Modes
 
-| Mode | Power cap | Demote threshold |
-|------|-----------|------------------|
-| **Auto** (default) | only above 78 °C (or when macOS starts throttling), released below 74 °C with 20 s of hysteresis | never — preserves foreground responsiveness |
-| Off | never | – |
-| Balanced | above 82 °C, release at 72 °C | ≥ 70 % CPU |
-| Cool & Quiet | always | ≥ 45 % CPU |
-| Max Cool | always | ≥ 30 % CPU |
+| Mode | Power cap | Demote threshold | RAM ladder |
+|------|-----------|------------------|------------|
+| **Auto** (default) | only above 78 °C (or when macOS starts throttling), released below 74 °C with 20 s of hysteresis | never — preserves foreground responsiveness | critical pressure, or a hot **and** churning chip |
+| Off | never | – | monitoring only |
+| Balanced | above 82 °C, release at 72 °C | ≥ 70 % CPU | critical pressure, or a hot **and** churning chip |
+| Cool & Quiet | always | ≥ 45 % CPU | high pressure, or a warm churning chip |
+| Max Cool | always | ≥ 30 % CPU | high pressure, or a warm churning chip |
+
+The RAM column is the pressure at which the governor will consider asking an
+idle app to quit. Cache is always dropped first, in every mode, and each mode
+has its own purge cooldown (30 min / 30 min / 15 min / 7.5 min) and hourly cap
+(2 / 2 / 3 / 4).
 
 ### Hardware acceleration, in auto mode
 
@@ -141,14 +171,15 @@ no restarts, no config writes, no polls beyond the existing 2 s dashboard tick.
 Headless entry points, also used to test it:
 
 ```bash
-ThermalGuard --self-test      # 47 unit tests over the decision tables
+ThermalGuard --self-test      # 84 unit tests over the decision tables
 ThermalGuard --media-pulse    # {"video":false,"camera":true}, exit 0 while a session is live
 ThermalGuard --accel-check    # every watch app + its usage, exit 3 if any is off
 ThermalGuard --accel-fix      # repairs what is owed, holding during a live session
 ThermalGuard --chrome-check    # Chrome background guard state and intended action
-ThermalGuard --memory-check    # memory pressure and idle-app candidates
+ThermalGuard --memory-check    # pressure, RAM plan, idle-apps, plus source (daemon/local) and helper_stale
 ThermalGuard --codec-check     # VideoToolbox H.264/HEVC capability and verdict
 ThermalGuard --effects-check   # reduce-motion/transparency/animation switches and their values
+ThermalGuard --ram-log <n>     # sample temp + RAM churn every 2 s for <n> seconds (1–7200), read-only
 ```
 
 ### Calls and video are protected (automatic)
@@ -203,9 +234,25 @@ the download before opening it:
 
 ```bash
 cd ~/Downloads
-shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.8.4.dmg
-md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.8.4.dmg
+shasum -a 256 -c SHA256SUMS     # or: shasum -a 256 ThermalGuard-1.9.1.dmg
+md5 -c MD5SUMS                  # or: md5 -r ThermalGuard-1.9.1.dmg
 ```
+
+### Updating the helper
+
+The app and its privileged helper are installed separately: a DMG install
+replaces `ThermalGuard.app`, while launchd keeps running the helper it loaded at
+boot. A freshly installed app can therefore be talking to an older
+`thermalguardd`. The app compares `daemon_version` with its own bundle version
+and, on a mismatch, shows **“Thermal helper is out of date”** with an **Update
+Thermal Helper…** button (also in the “More” menu) — one admin prompt reloads
+it. The app never asks for a password on its own.
+
+Nothing else depends on that update. The daemon is the single source of truth
+for memory, and the UI trusts a daemon sample only when it carries a VM total;
+if the running helper predates those fields, the app reads memory itself rather
+than rendering a zeroed card as “unreadable”. `--memory-check` reports which
+path was taken (`source`) and whether the running helper is `helper_stale`.
 
 ## Local setup
 
@@ -245,8 +292,8 @@ Publishing is tag-driven (`.github/workflows/release.yml`). Bump
 `app/Info.plist`, then:
 
 ```bash
-git tag -a v1.8.4 -m "ThermalGuard 1.8.4"   # the tag message becomes the release notes
-git push origin v1.8.4
+git tag -a v1.9.1 -m "ThermalGuard 1.9.1"   # the tag message becomes the release notes
+git push origin v1.9.1
 ```
 
 CI runs the test suite, rebuilds from that commit, and attaches the DMG,
@@ -256,9 +303,10 @@ CI runs the test suite, rebuilds from that commit, and attaches the DMG,
 
 ```bash
 cd daemon
-cargo test              # 88 unit + 25 integration (IPC) tests
+cargo test              # 115 unit + 33 integration (IPC) tests
 cargo test --release    # same, optimised build
 cargo run --release -- --memory-probe   # one Mach VM sample + µs per sample
+cargo run --release -- --ram-plan       # live churn + the ladder decision for every mode
 ```
 
 ### Idle cost
@@ -267,7 +315,7 @@ Measured on MacBookAir9,1 over a 60 s window with `ps`: the daemon uses about
 0.3 s CPU per minute (≈0.5 % of one core) and 2.6 MB RSS. Temperature, fan and
 SMC readings are sampled every 2 s; `pmset` readings are cached (6 s for the
 speed limit, 30 s for AC), the process scan runs every 4 s, the ioreg battery
-fallback every 15 s, memory is a 15 µs Mach call every 2 s, the network probe
+fallback every 15 s, memory is a tens-of-µs Mach call every 2 s, the network probe
 every 30 s, and the state file is rewritten every 10 s. Log timestamps no longer
 spawn `date`. The UI redraws every 2 s but only forks for its guards on 8–15 s
 cadences, and checks for the helper every 30 s.
@@ -277,10 +325,11 @@ never-demote/protected-process rules, the curated Apple-service allowlist,
 launchd path validation (no caller-supplied paths), socket permissions,
 oversized/truncated requests, handler-panic isolation, label sanitisation, the
 Core Audio watchdog's rate limits and SIGTERM-only reset path (against a stub
-`killall`, never the real engine), the memory-reclaim brakes (`memory::*`), and
-the full JSON contract the UI depends on.
+`killall`, never the real engine), the RAM ladder (`ram::*`: thermal bands,
+churn math, per-mode tolerances, every brake and every escalation), and the
+full JSON contract the UI depends on.
 
-The Swift side adds 69 unit tests over the acceleration, Chrome, memory, codec
+The Swift side adds 84 unit tests over the acceleration, Chrome, memory, codec
 and reduced-effects decision tables (`ThermalGuard --self-test`), plus read-only
 headless checks (`--chrome-check`, `--memory-check`, `--codec-check`,
 `--effects-check`). One of those tests runs the defaults write / read-back /
@@ -346,13 +395,23 @@ Small wins that are worth doing by hand:
 - Every accepted setting (mode, fan, shields, trimmer, reclaim) is written to
   `state.json` immediately, not on the 10 s housekeeping tick, so a shutdown or
   crash seconds after a change can never resurrect an older mode.
-- `policy.rs`, `trim.rs`, `audio.rs`, `memory.rs` and `net.rs` are pure
-  functions; all side effects live in `system.rs` / `procs.rs`, so every
+- `policy.rs`, `trim.rs`, `audio.rs`, `memory.rs`, `ram.rs` and `net.rs` are
+  pure functions; all side effects live in `system.rs` / `procs.rs`, so every
   decision (heat, audio reset, reclaim, network verdict) is testable without
   hardware, pressure or a live link.
+- `memory.rs` measures (pressure band, trend, thresholds); `ram.rs` decides
+  (the ladder). Splitting them means a new signal is one struct field in
+  `ram::Inputs`, and a new rung is one early return with its own `Reason`
+  variant — the UI gets the explanation for free instead of parsing numbers.
+  `Tuning::for_mode` is a table, the same shape as `policy::Tuning`.
+- The governor is fed **deltas**, not totals: `ram::Churn::between` turns two
+  cumulative Mach counter samples into faults/s, and a counter that goes
+  backwards (reboot, garbage read) yields no churn rather than a fake spike.
 - The memory sampler is the one hot path written like driver code: direct Mach
-  and `sysctlbyname` FFI, no process spawns, ~15 µs per sample. It only ever
-  **reads** kernel counters; the VM subsystem itself stays Apple's.
+  and `sysctlbyname` FFI, no process spawns, tens of microseconds per sample.
+  It only ever **reads** kernel counters; the VM subsystem itself stays
+  Apple's. The UI no longer forks `vm_stat`/`sysctl` at all while the helper is
+  answering.
 - Hysteresis on the cap (82 → 72 °C) prevents mode flapping.
 - Every write is verified: fan target by read‑back, power cap by re‑reading
   `pmset -g custom`, demotion by return value. Failures are logged, not hidden.

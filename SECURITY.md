@@ -31,14 +31,15 @@ regression test.
 | 10 | **Medium** | Auto-trim could have disabled arbitrary Apple services if a caller could widen the allowlist or the persisted tracked set. | Auto-trim is default-on but user-toggleable, active in every mode except Off, and only compiled-in `auto_safe` ids are ever eligible. The persisted tracked set is re-validated against the catalog on every tick and on load; tampered ids are ignored. Only one service changes per daemon tick, and SIP-refused services are backed off for 5 min, and a running trimmed job is stopped with SIGTERM only after its id passed the catalog check. | `auto_trim_is_on_by_default_strictly_boolean_and_restores_on_disable`, `tampered_tracked_ids_cannot_touch_non_auto_safe_services`, `trim::*` (11 tests) |
 | 11 | **Medium** | Chrome's background mode and Google agents could be touched while Chrome is running, racing the app and losing the original value. | `disableChromeBackground` only runs once Chrome has quit; the original `background_mode` is stored (as JSON) before overwriting, and `restoreChromeBackground` only writes when the guard is off or Chrome is closed. Google agents are disabled/enabled by exact label against a compiled-in list; the stored list is re-filtered to that catalog on restore. | `chromeGuardAction` pure policy (11 tests), `isChromeHelperPath` (4 tests) |
 | 12 | **Medium** | Chrome helpers could be killed by PID reuse if a PID was recycled between listing and signalling. | The executable path is re-read with `ps -p <pid> -o comm=` immediately before `kill`, and `isChromeHelperPath` is re-applied; the main Chrome binary is explicitly excluded. | `isChromeHelperPath` tests |
-| 13 | **Low** | Graceful memory unloading could have force-killed or purged memory. | Only `terminate()` is ever used (graceful, app can refuse); `purge` runs only through the daemon's own bounded reclaim policy (finding 17), never from the UI; protected, frontmost, windowed, audio, camera and busy apps are excluded, and a refusal is backed off for 30 minutes. | `shouldQuitIdleApp` (13 tests), `memoryPressureLevel` (6 tests) |
+| 13 | **Low** | Graceful memory unloading could have force-killed or purged memory. | Only `terminate()` is ever used (graceful, app can refuse); `purge` runs only through the daemon's own bounded reclaim policy (finding 17), never from the UI; protected, frontmost, windowed, audio, camera and busy apps are excluded, and a refusal is backed off for 30 minutes. | `shouldQuitIdleApp`, `memoryIdleThreshold`, `memoryPressureLevel` |
 | 14 | **Low** | The T2/codec guard could have claimed hardware support on models without it, or installed a browser extension silently. | Support is read from VideoToolbox (`VTIsHardwareDecodeSupported` plus `VTCopyVideoEncoderList` for encode), which is model-generic. h264ify is detected read-only and only a Web Store link is offered; nothing is installed or enabled. | `codecVerdict` (5 tests) |
 | 15 | **Low** | Auto-trim leaves services disabled if the app is uninstalled while trimmed. | Documented; the daemon restores tracked services on selecting Off / toggling the trimmer off / startup. Uninstall instructions now tell the user to turn Auto-trim off first. | manual |
 | 16 | **Medium** | An automatic `coreaudiod` restart is a root signal to a shared system daemon: unthrottled it would be a denial-of-service on audio, and a caller-supplied target would be arbitrary process signalling. | The watchdog only fires on two consecutive samples above 20 % CPU, at most once per 10 min and 3×/hour, sending one SIGTERM (never SIGKILL) to the compiled-in name `coreaudiod` via absolute `/usr/bin/killall` with an argv array; the relaunch is verified by re-reading the PID. The `audio_restart` IPC hook exists only when `overrides_allowed()` (non-root + `THERMALGUARD_TESTING=1`) and is refused by the installed daemon. | `audio::*` (6 unit tests), `audio_watchdog_is_on_by_default_and_togglable`, `audio_reset_path_uses_sigterm_and_is_verified` |
-| 17 | **Medium** | An automatic `purge` driven by IPC input could be turned into a repeated machine-wide stall, or accept caller-supplied flags. | The daemon decides on its own measured numbers; the IPC setting is a strict boolean only. `purge` is called with an empty argv and absolute path, only when the kernel reports warning/critical pressure, ≥ 1 GB is provably reclaimable, swap is below 70 %, and the 30 min / 2-per-hour budget allows it. The `memory_reclaim_now` hook exists only under `overrides_allowed()` and is refused by the installed daemon. | `memory::*` (6 unit tests), `memory_reclaim_path_runs_without_arguments_and_is_verified`, `memory_reclaim_is_strictly_boolean` |
+| 17 | **Medium** | An automatic `purge` driven by IPC input could be turned into a repeated machine-wide stall, or accept caller-supplied flags. | The daemon decides on its own measured numbers; the IPC setting is a strict boolean only. `purge` is called with an empty argv and absolute path, only when the kernel reports warning/critical pressure, ≥ 1 GB is provably reclaimable, swap is below 70 %, and the 30 min / 2-per-hour budget allows it. The `memory_reclaim_now` hook exists only under `overrides_allowed()` and is refused by the installed daemon. | `ram::*` (24 unit tests), `off_mode_steps_the_ram_governor_aside`, `switching_reclaim_off_is_reported_as_its_own_reason`, `ram_governor_publishes_one_well_formed_decision`, `memory_reclaim_path_runs_without_arguments_and_is_verified`, `memory_reclaim_is_strictly_boolean` |
 | 18 | **Medium** | The applied power cap was not part of the persisted state, so a crash or restart while capped left macOS capped while the daemon believed nothing was applied — the cap could stay on indefinitely (the reported "stuck cap"), or be re-applied to a machine the user had since set to Off. | `cap_active` is written to the state file and restored on load, a restored cap keeps its dwell instead of being released on the first tick, and Off releases it on the next tick. | `power_cap_state_survives_a_restart_and_is_released_by_off` |
 | 19 | **Medium** | A refused `pmset` write was retried on every 2 s tick for the life of the process: a machine that rejects the write would fork `pmset` forever, and the flapping attempt was visible in the state. | A refused cap change backs off for 60 s and is logged once; the applied state is only updated after a successful write. | `power_cap_turns_on_with_a_cooling_mode_and_off_again` (exactly one on and one off write, no flapping) |
 | 20 | **Low** | Fan writes could take the fan out of Apple's curve on a model that ignores the target, leaving the chassis with no cooling ramp. | `F0Md = 1` (manual) is only written *after* `F0Tg` read-back proved the target was accepted, and any refused/failed target writes `F0Md = 0` again. The maximum target goes through the same plausibility checks as the quiet target (`max_fan_target`). | `max_fan_target_refuses_to_write_an_implausible_value`, `fan_preference_defaults_to_silent` |
+| 21 | **Low** | A DMG install replaced the app but not the privileged helper launchd had already loaded, so a new UI could talk to an older daemon. Fields the app expected (the VM totals behind the RAM card) were absent, rendered as "unreadable", and the app could not tell "old helper" from "no data". | The daemon is the single source of truth and publishes `memory_total_mb` / `memory_available_mb`; the UI trusts a daemon sample only when it carries a total and otherwise reads memory itself, so a stale helper degrades to a local read instead of a broken card. The app compares `daemon_version` with its own bundle version and, on a mismatch, shows an "out of date" banner whose button re-runs the one-prompt helper install; `unknown` (a versionless self-test binary) never prompts. | `resolvedMemoryStats` (3 tests), `helperIsStale` (5 tests) |
 
 ## Auto-trim safety invariants
 
@@ -73,8 +74,13 @@ regression test.
 ## Memory guard invariants
 
 - Default on, runs in every mode except Off.
-- Pressure is derived from `vm_stat` and `vm.swapusage`, exactly like the UI, so
-  both sides agree on `normal` / `high` / `critical`.
+- The daemon is the single source of truth: it publishes `memory_pressure`,
+  `memory_plan`, `memory_plan_reason` and `memory_band` on the status contract,
+  and the UI executes only the `trim` rung. The UI has no second pressure
+  classifier to disagree with.
+- `memory_free_pct` is free **plus reclaimable** (purgeable and file-backed)
+  memory, not raw free pages, so a healthy Mac cannot read as 1 % free. Both the
+  governor and the card use that one number instead of computing their own.
 - The pressure band is `kern.memorystatus_vm_pressure_level` (1 normal,
   2 warning, 4 critical), the kernel's own verdict; free-page thresholds are
   only a fallback when it is unreadable. macOS keeps free pages low on purpose,
@@ -82,14 +88,17 @@ regression test.
 - Sampling is read-only FFI (`host_statistics64` and `sysctlbyname`), with no
   child processes, no writes to kernel state and no caller input; the Mach host
   port is deallocated on every call so the daemon cannot leak send rights.
-- `purge` runs only under high/critical kernel pressure, with at least 1 GB of
-  measured reclaimable (purgeable + file-backed) cache, and swap use below 70 %.
-  It is rate-limited to once per 30 minutes and twice per hour, takes **no
-  arguments**, is invoked by absolute path, and its effect is measured
+- `purge` runs only when the ladder (`ram::decide`) selects it: high/critical
+  kernel pressure (or measured churn while there is thermal headroom), at least
+  1 GB of reclaimable (purgeable + file-backed) cache, swap below 70 %, outside
+  the mode's cooldown and hourly cap, and never merely because the chip is hot.
+  A purge that frees under 128 MB is not repeated for 15 minutes. It takes
+  **no arguments**, is invoked by absolute path, and its effect is measured
   afterwards rather than assumed.
 - Candidates must be regular user apps under `/Applications` or `~/Applications`,
   not protected, with no window, not frontmost, no audio, no camera, CPU below
-  3 %, and idle for 10 min (5 min at critical pressure).
+  3 %, and idle for the mode's threshold: 10 min normally, 5 min at critical
+  pressure or when the daemon reports a hot/critical chip.
 - Quit is requested with `terminate()` only; a refusal is backed off 30 min.
 
 ## Codec guard invariants

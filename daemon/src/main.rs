@@ -12,6 +12,7 @@ mod memory;
 mod net;
 mod policy;
 mod procs;
+mod ram;
 mod smc;
 mod system;
 mod trim;
@@ -127,16 +128,30 @@ struct Shared {
     /// User setting: reclaim OS cache under pressure (default on).
     memory_reclaim: bool,
     mem_pressure: memory::Pressure,
+    /// Percentage of RAM available without reclaim (free + inactive +
+    /// speculative). This is the number the UI shows as "Free".
     mem_free_pct: f64,
+    mem_total_mb: f64,
+    mem_available_mb: f64,
     mem_compressed_mb: f64,
     mem_reclaimable_mb: f64,
+    mem_swap_used_mb: f64,
+    mem_swap_total_mb: f64,
     mem_swap_used_pct: f64,
     memory_reclaims: u32,
     memory_last: Option<Instant>,
     memory_window: Vec<Instant>,
     memory_note: String,
-    memory_advice: memory::Advice,
     memory_trend: memory::Trend,
+    /// Thermal band the RAM governor used for its last decision.
+    mem_band: ram::ThermalBand,
+    /// Fault traffic that became heat between the last two samples.
+    mem_churn: ram::Churn,
+    /// The full ladder decision, so the UI shows the daemon's verdict rather
+    /// than re-deriving pressure from a `vm_stat` fork of its own.
+    memory_decision: ram::Decision,
+    /// What the last purge actually freed, in MB. `None` until one is measured.
+    memory_freed_mb: Option<f64>,
     net_link: String,
     net_interface: String,
     net_rssi: Option<f64>,
@@ -206,15 +221,22 @@ impl Default for Shared {
             memory_reclaim: true,
             mem_pressure: memory::Pressure::Normal,
             mem_free_pct: 0.0,
+            mem_total_mb: 0.0,
+            mem_available_mb: 0.0,
             mem_compressed_mb: 0.0,
             mem_reclaimable_mb: 0.0,
+            mem_swap_used_mb: 0.0,
+            mem_swap_total_mb: 0.0,
             mem_swap_used_pct: 0.0,
             memory_reclaims: 0,
             memory_last: None,
             memory_window: Vec::new(),
             memory_note: String::new(),
-            memory_advice: memory::Advice::Hold,
             memory_trend: memory::Trend::default(),
+            mem_band: ram::ThermalBand::Warm,
+            mem_churn: ram::Churn::default(),
+            memory_decision: ram::Decision::default(),
+            memory_freed_mb: None,
             net_link: "—".into(),
             net_interface: String::new(),
             net_rssi: None,
@@ -374,6 +396,11 @@ fn state_json(sh: &Shared) -> String {
         .collect();
 
     json::obj(&[
+        // The helper's own version. The app compares this with its bundle
+        // version: a DMG install does not replace a privileged helper that is
+        // already loaded, so without this the UI would talk to an old daemon
+        // forever and silently lose any field the new one adds.
+        json::s("daemon_version", env!("CARGO_PKG_VERSION")),
         json::s("mode", sh.mode.as_str()),
         json::s("mode_label", sh.mode.label()),
         json::s("fan_intent", sh.fan_intent.as_str()),
@@ -402,18 +429,41 @@ fn state_json(sh: &Shared) -> String {
         },
         json::b("memory_reclaim", sh.memory_reclaim),
         json::s("memory_pressure", sh.mem_pressure.as_str()),
+        json::s("memory_band", sh.mem_band.as_str()),
         json::n("memory_free_pct", (sh.mem_free_pct * 10.0).round() / 10.0),
+        json::n("memory_total_mb", sh.mem_total_mb.round()),
+        json::n("memory_available_mb", sh.mem_available_mb.round()),
         json::n("memory_compressed_mb", sh.mem_compressed_mb.round()),
         json::n("memory_reclaimable_mb", sh.mem_reclaimable_mb.round()),
+        json::n("memory_swap_used_mb", sh.mem_swap_used_mb.round()),
+        json::n("memory_swap_total_mb", sh.mem_swap_total_mb.round()),
         json::n(
             "memory_swap_used_pct",
             (sh.mem_swap_used_pct * 10.0).round() / 10.0,
         ),
         json::i("memory_reclaims", sh.memory_reclaims as i64),
-        json::s("memory_advice", sh.memory_advice.as_str()),
+        // Backwards-compatible alias for `memory_plan`.
+        json::s("memory_advice", sh.memory_decision.as_str()),
         json::n(
             "memory_trend_mb_s",
             (sh.memory_trend.compressed_mb_per_s * 10.0).round() / 10.0,
+        ),
+        // The ladder the daemon settled on, plus the reason, so the UI never
+        // has to second-guess it with a coarser `vm_stat` sample.
+        json::s("memory_plan", sh.memory_decision.as_str()),
+        json::s("memory_plan_reason", sh.memory_decision.reason.as_str()),
+        json::s("memory_plan_detail", sh.memory_decision.detail()),
+        json::n(
+            "memory_heat_load",
+            (sh.mem_churn.heat_load() * 10.0).round() / 10.0,
+        ),
+        json::n(
+            "memory_churn_decomp_s",
+            (sh.mem_churn.decompressions_per_s * 10.0).round() / 10.0,
+        ),
+        json::n(
+            "memory_churn_swapin_s",
+            (sh.mem_churn.swapins_per_s * 10.0).round() / 10.0,
         ),
         json::s("memory_note", &sh.memory_note),
         json::s("net_link", &sh.net_link),
@@ -977,8 +1027,10 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                 Ok(_) => {
                     let mut sh = shared.lock().unwrap();
                     sh.memory_reclaims += 1;
-                    sh.memory_last = Some(Instant::now());
-                    sh.memory_window.push(Instant::now());
+                    let now = Instant::now();
+                    sh.memory_last = Some(now);
+                    sh.memory_freed_mb = None;
+                    sh.memory_window.push(now);
                     sh.memory_note = "Reclaimable cache was released (test hook).".into();
                     push_event(&mut sh, "memory reclaim (test hook)");
                     state_json(&sh)
@@ -1239,7 +1291,7 @@ fn smc_holder() -> Option<smc::Smc> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        println!("thermalguardd 1.8.4");
+        println!("thermalguardd {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.iter().any(|a| a == "--memory-probe") {
@@ -1252,18 +1304,185 @@ fn main() {
         let avg_us = started.elapsed().as_secs_f64() * 1e6 / n as f64;
         match last {
             Some(m) => println!(
-                "{{\"total_mb\":{:.0},\"free_mb\":{:.0},\"compressed_mb\":{:.0},\"reclaimable_mb\":{:.0},\"swap_used_mb\":{:.0},\"swap_total_mb\":{:.0},\"swap_used_pct\":{:.1},\"kernel_pressure\":{},\"avg_us\":{:.1}}}",
+                "{{\"total_mb\":{:.0},\"free_mb\":{:.0},\"available_mb\":{:.0},\"free_pct\":{:.1},\"compressed_mb\":{:.0},\"reclaimable_mb\":{:.0},\"swap_used_mb\":{:.0},\"swap_total_mb\":{:.0},\"swap_used_pct\":{:.1},\"kernel_pressure\":{},\"compressions\":{},\"decompressions\":{},\"swapins\":{},\"swapouts\":{},\"avg_us\":{:.1}}}",
                 m.total_mb,
                 m.free_mb,
+                m.available_mb,
+                if m.total_mb > 0.0 {
+                    m.available_mb / m.total_mb * 100.0
+                } else {
+                    0.0
+                },
                 m.compressed_mb,
                 m.reclaimable_mb,
                 m.swap_used_mb,
                 m.swap_total_mb,
                 m.swap_used_pct,
                 m.kernel_pressure.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+                m.compressions,
+                m.decompressions,
+                m.swapins,
+                m.swapouts,
                 avg_us
             ),
             None => println!("{{\"error\":\"memory stats unreadable\"}}"),
+        }
+        return;
+    }
+    // One real decision per mode, from a live two-sample churn window. Read
+    // only: it prints the ladder, it never purges.
+    if args.iter().any(|a| a == "--ram-plan") {
+        let before = system::memory_stats();
+        let t0 = Instant::now();
+        thread::sleep(Duration::from_secs(1));
+        let after = system::memory_stats();
+        let (Some(b), Some(a)) = (before, after) else {
+            println!("{{\"error\":\"memory stats unreadable\"}}");
+            return;
+        };
+        let churn = ram::Churn::between(&b.counters(), &a.counters(), t0.elapsed().as_secs_f64());
+        let temp = read_first(&smc_holder(), smc::CPU_TEMP_KEYS);
+        let limit = system::cpu_speed_limit();
+        let band = ram::thermal_band(
+            temp,
+            limit.map(|v| v < policy::THROTTLE_LIMIT).unwrap_or(false),
+        );
+        let free_pct = if a.total_mb > 0.0 {
+            a.available_mb / a.total_mb * 100.0
+        } else {
+            0.0
+        };
+        let compressed_pct = if a.total_mb > 0.0 {
+            a.compressed_mb / a.total_mb * 100.0
+        } else {
+            0.0
+        };
+        let pressure =
+            memory::pressure_level(a.kernel_pressure, free_pct, a.swap_used_pct, compressed_pct);
+        let plans: Vec<String> = [
+            Mode::Auto,
+            Mode::Balanced,
+            Mode::CoolQuiet,
+            Mode::MaxCool,
+            Mode::Off,
+        ]
+        .iter()
+        .map(|mode| {
+            let d = ram::decide(&ram::Inputs {
+                enabled: true,
+                mode: *mode,
+                pressure,
+                band,
+                churn,
+                trend: memory::Trend::default(),
+                reclaimable_mb: a.reclaimable_mb,
+                swap_used_pct: a.swap_used_pct,
+                purge_since_s: u64::MAX,
+                purges_last_hour: 0,
+                last_purge: None,
+            });
+            format!(
+                "{{\"mode\":\"{}\",\"plan\":\"{}\",\"reason\":\"{}\",\"detail\":\"{}\"}}",
+                mode.as_str(),
+                d.as_str(),
+                d.reason.as_str(),
+                json::esc(d.detail())
+            )
+        })
+        .collect();
+        println!(
+            "{{\"temp\":{},\"band\":\"{}\",\"pressure\":\"{}\",\"reclaimable_mb\":{:.0},\"swap_used_pct\":{:.1},\"heat_load\":{:.1},\"plans\":[{}]}}",
+            temp.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "null".into()),
+            band.as_str(),
+            pressure.as_str(),
+            a.reclaimable_mb,
+            a.swap_used_pct,
+            churn.heat_load(),
+            plans.join(",")
+        );
+        return;
+    }
+    // Record churn vs. die temperature for N seconds so the two thresholds
+    // (CHURN_NOTABLE_PER_S / CHURN_HEAVY_PER_S) can be tuned against real
+    // hardware instead of reason. Read-only: it samples, it never purges.
+    if let Some(secs) = args
+        .iter()
+        .position(|a| a == "--ram-log")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0 && n <= 7200)
+    {
+        let smc = smc_holder();
+        let mut last = system::memory_stats();
+        let mut last_t = Instant::now();
+        let mut first = true;
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        println!(
+            "{{\"seconds\":{},\"note\":\"one JSON line per 2 s sample; churn is between this and the previous sample; exit 0\"}}",
+            secs
+        );
+        while Instant::now() < deadline {
+            let now = Instant::now();
+            if let Some(m) = system::memory_stats() {
+                let dt = now.duration_since(last_t).as_secs_f64();
+                let churn = last
+                    .as_ref()
+                    .map(|b| ram::Churn::between(&b.counters(), &m.counters(), dt))
+                    .unwrap_or_default();
+                let temp = read_first(&smc, smc::CPU_TEMP_KEYS);
+                let free_pct = if m.total_mb > 0.0 {
+                    m.available_mb / m.total_mb * 100.0
+                } else {
+                    0.0
+                };
+                let compressed_pct = if m.total_mb > 0.0 {
+                    m.compressed_mb / m.total_mb * 100.0
+                } else {
+                    0.0
+                };
+                let pressure =
+                    memory::pressure_level(m.kernel_pressure, free_pct, m.swap_used_pct, compressed_pct);
+                let band = ram::thermal_band(
+                    temp,
+                    m.swap_used_pct >= 100.0 || pressure == memory::Pressure::Critical,
+                );
+                let plan = ram::decide(&ram::Inputs {
+                    enabled: true,
+                    mode: crate::policy::Mode::Auto,
+                    pressure,
+                    band,
+                    churn,
+                    trend: memory::Trend::default(),
+                    reclaimable_mb: m.reclaimable_mb,
+                    swap_used_pct: m.swap_used_pct,
+                    purge_since_s: u64::MAX,
+                    purges_last_hour: 0,
+                    last_purge: None,
+                });
+                println!(
+                    "{{\"t\":{:.1},\"temp\":{},\"band\":\"{}\",\"pressure\":\"{}\",\"free_pct\":{:.1},\"compressed_mb\":{:.0},\"reclaimable_mb\":{:.0},\"swap_used_pct\":{:.1},\"decomp_s\":{:.1},\"swapin_s\":{:.1},\"heat_load\":{:.1},\"notable\":{},\"heavy\":{},\"plan\":\"{}\",\"reason\":\"{}\"}}",
+                    dt,
+                    temp.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "null".into()),
+                    band.as_str(),
+                    pressure.as_str(),
+                    free_pct,
+                    m.compressed_mb,
+                    m.reclaimable_mb,
+                    m.swap_used_pct,
+                    churn.decompressions_per_s,
+                    churn.swapins_per_s,
+                    churn.heat_load(),
+                    churn.is_notable(),
+                    churn.is_heavy(),
+                    plan.as_str(),
+                    plan.reason.as_str()
+                );
+                last = Some(m);
+                last_t = now;
+            }
+            thread::sleep(Duration::from_secs(2));
+            let _ = first;
+            first = false;
         }
         return;
     }
@@ -1430,6 +1649,9 @@ fn main() {
     let mut last_mem_scan = Instant::now() - Duration::from_secs(2);
     // Short ring of Mach samples used for the compressor/swap trend.
     let mut mem_samples: Vec<(Instant, f64, f64)> = Vec::new();
+    // Previous counters and sample time, so churn is a real delta rather than
+    // a reading of a monotonic total.
+    let mut last_mem_counters: Option<(Instant, ram::Counters)> = None;
     let mut last_net_scan = Instant::now() - Duration::from_secs(30);
     let mut last_trim_scan = Instant::now() - Duration::from_secs(15);
     let mut logged_cap = false;
@@ -1581,8 +1803,20 @@ fn main() {
         } else {
             None
         };
-        if let Some(m) = mem {
-            mem_samples.push((Instant::now(), m.compressed_mb, m.swap_used_mb));
+        // Churn: the part of memory management that becomes heat. Derived from
+        // two cumulative-counter samples, so it is a rate, not a total.
+        let mut churn = ram::Churn::default();
+        if let Some(m) = &mem {
+            let now = Instant::now();
+            if let Some((then, counters)) = &last_mem_counters {
+                churn = ram::Churn::between(
+                    counters,
+                    &m.counters(),
+                    now.duration_since(*then).as_secs_f64(),
+                );
+            }
+            last_mem_counters = Some((now, m.counters()));
+            mem_samples.push((now, m.compressed_mb, m.swap_used_mb));
         }
         mem_samples.retain(|(t, _, _)| t.elapsed().as_secs_f64() < memory::TREND_WINDOW_S + 5.0);
         let mem_trend = memory::trend(
@@ -1784,14 +2018,19 @@ fn main() {
             }
         }
 
-        // 4) OS-level memory reclamation. Decided under the lock, performed
-        //    outside it, then measured: a purge that freed nothing must not be
-        //    reported as a success.
-        let memory_action = {
+        // 4) Memory: decide the ladder under the lock, perform the side effect
+        //    outside it, then measure the result. The governor is thermal-aware,
+        //    so a hot chip does not get an extra I/O burst for advisory
+        //    pressure, and a climbing compressor is stopped while it is cheap.
+        let memory_decision = {
             let mut sh = shared.lock().unwrap();
-            if let Some(m) = mem {
+            if let Some(m) = &mem {
+                // "Free" for a person means memory the kernel can hand out
+                // without reclaiming: free + inactive + speculative. Free
+                // pages alone sit near zero on a healthy Mac by design, which
+                // is what made the UI read "Free 0%".
                 let free_pct = if m.total_mb > 0.0 {
-                    m.free_mb / m.total_mb * 100.0
+                    m.available_mb / m.total_mb * 100.0
                 } else {
                     0.0
                 };
@@ -1807,52 +2046,84 @@ fn main() {
                     compressed_pct,
                 );
                 sh.mem_free_pct = free_pct;
+                sh.mem_total_mb = m.total_mb;
+                sh.mem_available_mb = m.available_mb;
                 sh.mem_compressed_mb = m.compressed_mb;
                 sh.mem_reclaimable_mb = m.reclaimable_mb;
+                sh.mem_swap_used_mb = m.swap_used_mb;
+                sh.mem_swap_total_mb = m.swap_total_mb;
                 sh.mem_swap_used_pct = m.swap_used_pct;
+                sh.mem_churn = churn;
+                sh.mem_band = ram::thermal_band(
+                    cpu_temp,
+                    speed_limit
+                        .map(|v| v < policy::THROTTLE_LIMIT)
+                        .unwrap_or(false),
+                );
             }
             sh.memory_window.retain(|t| t.elapsed().as_secs() < 3600);
             sh.memory_trend = mem_trend;
-            sh.memory_advice =
-                memory::advice(sh.mem_pressure, sh.mem_reclaimable_mb, sh.mem_swap_used_pct);
-            let inputs = memory::Inputs {
+            let inputs = ram::Inputs {
                 enabled: sh.memory_reclaim,
-                mode_off: sh.mode == Mode::Off,
+                mode: sh.mode,
                 pressure: sh.mem_pressure,
+                band: sh.mem_band,
+                churn: sh.mem_churn,
+                trend: sh.memory_trend,
                 reclaimable_mb: sh.mem_reclaimable_mb,
                 swap_used_pct: sh.mem_swap_used_pct,
-                since_last_s: sh
+                purge_since_s: sh
                     .memory_last
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(u64::MAX),
-                reclaims_last_hour: sh.memory_window.len() as u32,
+                purges_last_hour: sh.memory_window.len() as u32,
+                last_purge: sh.memory_last.and_then(|t| {
+                    sh.memory_freed_mb
+                        .map(|freed| (freed, t.elapsed().as_secs()))
+                }),
             };
-            memory::plan(&inputs)
+            let decision = ram::decide(&inputs);
+            sh.memory_decision = decision;
+            decision
         };
-        if memory_action == memory::Action::Purge {
+        if memory_decision.rung == ram::Rung::DropCache {
             match system::purge_reclaimable() {
                 Ok(_) => {
                     let after = system::memory_stats();
-                    let note = match (mem, after) {
+                    let freed_mb = match (mem.as_ref(), after.as_ref()) {
+                        (Some(b), Some(a)) => (b.reclaimable_mb - a.reclaimable_mb).max(0.0),
+                        _ => 0.0,
+                    };
+                    let note = match (mem.as_ref(), after.as_ref()) {
                         (Some(b), Some(a)) => format!(
-                            "Reclaimed {:.0} MB of cache (free {:.0} -> {:.0} MB, compressed {:.0} -> {:.0} MB).",
-                            (b.reclaimable_mb - a.reclaimable_mb).max(0.0),
+                            "Reclaimed {:.0} MB of cache (free {:.0} -> {:.0} MB, compressed {:.0} -> {:.0} MB) [{}].",
+                            freed_mb,
                             b.free_mb,
                             a.free_mb,
                             b.compressed_mb,
-                            a.compressed_mb
+                            a.compressed_mb,
+                            memory_decision.reason.as_str()
                         ),
                         _ => "Purgeable and file-backed cache was released.".to_string(),
                     };
                     let mut sh = shared.lock().unwrap();
                     sh.memory_reclaims += 1;
-                    sh.memory_last = Some(Instant::now());
-                    sh.memory_window.push(Instant::now());
+                    let now = Instant::now();
+                    sh.memory_last = Some(now);
+                    sh.memory_freed_mb = Some(freed_mb);
+                    sh.memory_window.push(now);
                     sh.memory_note = note.clone();
                     push_event(&mut sh, &format!("memory reclaim: {}", note));
                 }
                 Err(e) => {
                     let mut sh = shared.lock().unwrap();
+                    // Count the failed attempt against the cooldown, or a
+                    // machine where `purge` is broken would spawn it on every
+                    // 2 s tick. Same reasoning as `cap_failed`.
+                    let now = Instant::now();
+                    sh.memory_last = Some(now);
+                    sh.memory_freed_mb = Some(0.0);
+                    sh.memory_window.push(now);
                     sh.memory_note = format!("Memory reclaim failed: {}", e);
                     push_event(&mut sh, &format!("memory reclaim failed: {}", e));
                 }

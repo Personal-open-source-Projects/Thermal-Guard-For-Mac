@@ -158,8 +158,15 @@ pub fn on_ac_power() -> bool {
 #[derive(Clone, Copy, Debug)]
 pub struct MemStats {
     pub total_mb: f64,
-    /// Free plus speculative pages: memory available without reclaim.
+    /// Free plus speculative pages: memory the kernel can hand out with no
+    /// reclaim at all. This is intentionally *not* what the UI calls "free":
+    /// macOS keeps it near zero because unused memory is cache.
     pub free_mb: f64,
+    /// Free + inactive + speculative: pages the kernel can hand out without
+    /// touching the compressor or swap. This is the number a person means by
+    /// "how much memory is free", and what `vm_stat`-based UIs have always
+    /// shown.
+    pub available_mb: f64,
     pub compressed_mb: f64,
     /// Purgeable + file-backed (external) pages: cache the kernel can drop.
     pub reclaimable_mb: f64,
@@ -168,6 +175,26 @@ pub struct MemStats {
     pub swap_used_pct: f64,
     /// `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
     pub kernel_pressure: Option<u8>,
+    // Cumulative counters. They only ever go up; the delta between two
+    // samples is the fault traffic that turns into CPU and disk heat, which
+    // is what the RAM governor actually reacts to.
+    pub compressions: u64,
+    pub decompressions: u64,
+    pub swapins: u64,
+    pub swapouts: u64,
+}
+
+impl MemStats {
+    /// The churn counters, in the shape [`crate::ram`] consumes. Kept here so
+    /// the pure decision layer never has to know about Mach.
+    pub fn counters(&self) -> crate::ram::Counters {
+        crate::ram::Counters::of(
+            self.compressions,
+            self.decompressions,
+            self.swapins,
+            self.swapouts,
+        )
+    }
 }
 
 #[repr(C)]
@@ -290,6 +317,7 @@ pub fn memory_stats() -> Option<MemStats> {
     Some(MemStats {
         total_mb,
         free_mb: to_mb(vm.free_count + vm.speculative_count),
+        available_mb: to_mb(vm.free_count + vm.inactive_count + vm.speculative_count),
         compressed_mb: to_mb(vm.compressor_page_count),
         reclaimable_mb: to_mb(vm.purgeable_count + vm.external_page_count),
         swap_used_mb,
@@ -297,6 +325,10 @@ pub fn memory_stats() -> Option<MemStats> {
         swap_used_pct,
         kernel_pressure: sysctl_named::<u32>("kern.memorystatus_vm_pressure_level")
             .map(|v| v as u8),
+        compressions: vm.compressions,
+        decompressions: vm.decompressions,
+        swapins: vm.swapins,
+        swapouts: vm.swapouts,
     })
 }
 

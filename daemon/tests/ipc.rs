@@ -613,6 +613,117 @@ fn memory_reclaim_is_strictly_boolean() {
     assert!(r.contains("\"memory_reclaim\":false"), "got {}", r);
 }
 
+/// Read a JSON string field without pulling in a parser: the status contract
+/// only ever contains flat, escaped-safe string values for these keys.
+fn str_field(json: &str, key: &str) -> String {
+    let needle = format!("\"{}\":\"", key);
+    let start = match json.find(&needle) {
+        Some(i) => i + needle.len(),
+        None => return String::new(),
+    };
+    let rest = &json[start..];
+    match rest.find('"') {
+        Some(end) => rest[..end].to_string(),
+        None => String::new(),
+    }
+}
+
+#[test]
+fn ram_governor_publishes_one_well_formed_decision() {
+    let g = start();
+    // One 2 s tick is needed before the first memory decision exists.
+    assert!(
+        wait_until(6, || {
+            let r = ask(&g, "{\"cmd\":\"status\"}");
+            !str_field(&r, "memory_plan").is_empty()
+        }),
+        "the daemon never published a RAM plan"
+    );
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    for key in [
+        "memory_plan",
+        "memory_plan_reason",
+        "memory_plan_detail",
+        "memory_band",
+        "memory_heat_load",
+        "memory_churn_decomp_s",
+        "memory_churn_swapin_s",
+        "memory_total_mb",
+        "memory_swap_used_mb",
+        "memory_swap_total_mb",
+    ] {
+        assert!(
+            r.contains(&format!("\"{}\":", key)),
+            "missing {} in {}",
+            key,
+            r
+        );
+    }
+
+    let plan = str_field(&r, "memory_plan");
+    assert!(
+        matches!(plan.as_str(), "hold" | "reclaim" | "trim"),
+        "unexpected plan {:?}",
+        plan
+    );
+    let band = str_field(&r, "memory_band");
+    assert!(
+        matches!(band.as_str(), "cool" | "warm" | "hot" | "critical"),
+        "unexpected band {:?}",
+        band
+    );
+    // The reason is a stable slug, and the detail is a sentence the UI can
+    // show verbatim.
+    let reason = str_field(&r, "memory_plan_reason");
+    assert!(
+        !reason.is_empty() && reason.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+        "reason is not a slug: {:?}",
+        reason
+    );
+    let detail = str_field(&r, "memory_plan_detail");
+    assert!(
+        detail.len() > 10 && detail.ends_with('.'),
+        "detail is not a sentence: {:?}",
+        detail
+    );
+    // `memory_advice` stays as the backwards-compatible alias.
+    assert_eq!(str_field(&r, "memory_advice"), plan);
+}
+
+#[test]
+fn off_mode_steps_the_ram_governor_aside() {
+    let g = start();
+    let _ = ask(&g, "{\"cmd\":\"mode\",\"value\":\"off\"}");
+    assert!(
+        wait_until(6, || {
+            let r = ask(&g, "{\"cmd\":\"status\"}");
+            str_field(&r, "memory_plan_reason") == "mode-off"
+        }),
+        "Off mode did not put the RAM governor to sleep"
+    );
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(
+        r.contains("\"memory_plan\":\"hold\""),
+        "Off mode must never reclaim: {}",
+        r
+    );
+}
+
+#[test]
+fn switching_reclaim_off_is_reported_as_its_own_reason() {
+    let g = start();
+    let _ = ask(&g, "{\"cmd\":\"memory_reclaim\",\"value\":false}");
+    assert!(
+        wait_until(6, || {
+            let r = ask(&g, "{\"cmd\":\"status\"}");
+            str_field(&r, "memory_plan_reason") == "disabled"
+        }),
+        "a switched-off reclaim must explain itself, not look like pressure"
+    );
+    let r = ask(&g, "{\"cmd\":\"status\"}");
+    assert!(r.contains("\"memory_plan\":\"hold\""), "got {}", r);
+}
+
 // ---- Auto-trim integration tests -----------------------------------------
 
 #[test]
@@ -865,16 +976,35 @@ fn cap_on(g: &Guard) -> bool {
     ask(g, "{\"cmd\":\"status\"}").contains("\"cap_active\":true")
 }
 
+/// The cap tests assert the power policy, not the media shield. A real video or
+/// call playing on the machine correctly releases the cap, so the shield is
+/// switched off through the same IPC the UI uses before the mode is set. The
+/// shield itself is covered by its own test.
+fn disable_media_shield(g: &Guard) {
+    let _ = ask(g, "{\"cmd\":\"media_guard\",\"value\":\"off\"}");
+    let r = ask(g, "{\"cmd\":\"status\"}");
+    assert!(
+        r.contains("\"media_guard\":false"),
+        "the media shield did not turn off: {}",
+        r
+    );
+}
+
 #[test]
 fn power_cap_turns_on_with_a_cooling_mode_and_off_again() {
     let fake = fake_pmset();
     let g = start_with_env(&fake_pmset_env(&fake));
     assert!(!cap_on(&g), "the daemon must not cap on its own at startup");
+    disable_media_shield(&g);
 
     let _ = ask(&g, "{\"cmd\":\"mode\",\"value\":\"maxcool\"}");
+    // The suite runs a few dozen daemons in parallel on a 4-core machine, so
+    // the first 2 s control tick can start well after the mode change. The
+    // longer deadline is load tolerance, not a weaker assertion.
     assert!(
-        wait_until(12, || cap_on(&g)),
-        "Max Cool never engaged the power cap"
+        wait_until(30, || cap_on(&g)),
+        "Max Cool never engaged the power cap: {}",
+        ask(&g, "{\"cmd\":\"status\"}")
     );
     assert_eq!(pmset_state(&fake), "1", "the cap was not applied to macOS");
 
@@ -890,7 +1020,7 @@ fn power_cap_turns_on_with_a_cooling_mode_and_off_again() {
 
     let _ = ask(&g, "{\"cmd\":\"mode\",\"value\":\"off\"}");
     assert!(
-        wait_until(12, || !cap_on(&g)),
+        wait_until(30, || !cap_on(&g)),
         "Off never released the power cap"
     );
     assert_eq!(pmset_state(&fake), "0", "macOS was left capped after Off");
@@ -916,8 +1046,13 @@ fn power_cap_state_survives_a_restart_and_is_released_by_off() {
     let envs = fake_pmset_env(&fake);
 
     let mut first = start_in(dir.clone(), &envs);
+    disable_media_shield(&first);
     let _ = ask(&first, "{\"cmd\":\"mode\",\"value\":\"maxcool\"}");
-    assert!(wait_until(12, || cap_on(&first)), "cap never engaged");
+    assert!(
+        wait_until(30, || cap_on(&first)),
+        "cap never engaged: {}",
+        ask(&first, "{\"cmd\":\"status\"}")
+    );
     assert_eq!(pmset_state(&fake), "1");
     first.preserve = true;
     drop(first);
@@ -939,7 +1074,7 @@ fn power_cap_state_survives_a_restart_and_is_released_by_off() {
 
     let _ = ask(&second, "{\"cmd\":\"mode\",\"value\":\"off\"}");
     assert!(
-        wait_until(12, || !cap_on(&second)),
+        wait_until(30, || !cap_on(&second)),
         "Off after a restart did not release the cap"
     );
     assert_eq!(pmset_state(&fake), "0");

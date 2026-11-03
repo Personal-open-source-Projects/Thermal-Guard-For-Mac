@@ -1,4 +1,4 @@
-//! Pure policy for OS-level memory reclamation.
+//! Signals and safety constants for OS-level memory reclamation.
 //!
 //! macOS already moves cold pages to the compressor and to swap by itself; the
 //! app must not fight that, and userspace cannot "move" anything. What it *can*
@@ -6,19 +6,16 @@
 //! options: drop purgeable/file-backed cache so allocations have somewhere to
 //! go, instead of immediately quitting the user's apps.
 //!
+//! This module owns the *measurement* (pressure level, trend) and the safety
+//! constants. [`crate::ram`] owns the decision ladder that consumes them and
+//! applies the thermal brakes; keeping the two apart is what lets each be
+//! tested without a hot chip or a live compressor.
+//!
 //! The primary signal is the kernel's own verdict,
 //! `kern.memorystatus_vm_pressure_level` (1 normal, 2 warning, 4 critical).
 //! Free-page percentages are only a fallback: macOS keeps "Pages free" low by
 //! design because unused RAM is cache, so a free-percentage rule on its own
 //! would purge a perfectly healthy machine.
-//!
-//! Additional brakes, all enforced here so they are testable without pressure:
-//!   * normal pressure is never acted on;
-//!   * less than [`MIN_RECLAIM_MB`] of reclaimable cache means a purge would
-//!     free nothing while still costing disk I/O;
-//!   * a machine already deep into swap is skipped: purging there adds I/O to a
-//!     thrashing system, which is the opposite of help;
-//!   * a cooldown and an hourly cap bound the worst case.
 
 /// Cache below this is not worth stalling the machine for.
 pub const MIN_RECLAIM_MB: f64 = 1024.0;
@@ -30,7 +27,8 @@ pub const MAX_PER_HOUR: u32 = 2;
 pub const SWAP_THRASH_PCT: f64 = 70.0;
 
 /// The same bands the UI uses, so both sides agree on "high" and "critical".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Ordered, so a rule can ask for "high or worse" instead of listing cases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Pressure {
     Normal,
     High,
@@ -79,35 +77,6 @@ pub fn pressure_level(
 /// How long the trend window looks back.
 pub const TREND_WINDOW_S: f64 = 20.0;
 
-/// What the daemon asks for at this pressure. Cache first — dropping cache has
-/// no user-visible cost — and app trimming only when there is nothing to drop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Advice {
-    Hold,
-    ReclaimCache,
-    TrimApps,
-}
-
-impl Advice {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Advice::Hold => "hold",
-            Advice::ReclaimCache => "reclaim",
-            Advice::TrimApps => "trim",
-        }
-    }
-}
-
-pub fn advice(pressure: Pressure, reclaimable_mb: f64, swap_used_pct: f64) -> Advice {
-    match pressure {
-        Pressure::Normal => Advice::Hold,
-        _ if reclaimable_mb >= MIN_RECLAIM_MB && swap_used_pct < SWAP_THRASH_PCT => {
-            Advice::ReclaimCache
-        }
-        _ => Advice::TrimApps,
-    }
-}
-
 /// Growth of the compressor and of swap across a window, in MB/s. Predictive,
 /// not reactive: a machine climbing into pressure is visible before it is
 /// critical, so cache can be dropped while it still helps.
@@ -135,60 +104,9 @@ pub fn trend(samples: &[(f64, f64, f64)], window_s: f64) -> Trend {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
-    None,
-    Purge,
-}
-
-pub struct Inputs {
-    /// User setting; on by default.
-    pub enabled: bool,
-    /// Mode::Off steps aside entirely.
-    pub mode_off: bool,
-    pub pressure: Pressure,
-    /// Purgeable + file-backed cache, in MB.
-    pub reclaimable_mb: f64,
-    pub swap_used_pct: f64,
-    /// Seconds since the last reclaim, `u64::MAX` when there never was one.
-    pub since_last_s: u64,
-    pub reclaims_last_hour: u32,
-}
-
-pub fn plan(i: &Inputs) -> Action {
-    if !i.enabled || i.mode_off || i.pressure == Pressure::Normal {
-        return Action::None;
-    }
-    if i.reclaimable_mb < MIN_RECLAIM_MB {
-        return Action::None;
-    }
-    if i.swap_used_pct >= SWAP_THRASH_PCT {
-        return Action::None;
-    }
-    if i.since_last_s < COOLDOWN_S {
-        return Action::None;
-    }
-    if i.reclaims_last_hour >= MAX_PER_HOUR {
-        return Action::None;
-    }
-    Action::Purge
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn inputs() -> Inputs {
-        Inputs {
-            enabled: true,
-            mode_off: false,
-            pressure: Pressure::High,
-            reclaimable_mb: 2048.0,
-            swap_used_pct: 20.0,
-            since_last_s: u64::MAX,
-            reclaims_last_hour: 0,
-        }
-    }
 
     #[test]
     fn the_kernel_verdict_wins_over_free_page_heuristics() {
@@ -212,50 +130,6 @@ mod tests {
     }
 
     #[test]
-    fn a_generous_cache_under_pressure_is_reclaimed() {
-        assert_eq!(plan(&inputs()), Action::Purge);
-    }
-
-    #[test]
-    fn nothing_happens_without_pressure_or_a_cache() {
-        let mut i = inputs();
-        i.pressure = Pressure::Normal;
-        assert_eq!(plan(&i), Action::None);
-        let mut i = inputs();
-        i.reclaimable_mb = MIN_RECLAIM_MB - 1.0;
-        assert_eq!(plan(&i), Action::None);
-    }
-
-    #[test]
-    fn off_mode_and_the_toggle_step_aside() {
-        let mut i = inputs();
-        i.mode_off = true;
-        assert_eq!(plan(&i), Action::None);
-        i.mode_off = false;
-        i.enabled = false;
-        assert_eq!(plan(&i), Action::None);
-    }
-
-    #[test]
-    fn a_thrashing_swap_is_never_made_worse() {
-        let mut i = inputs();
-        i.swap_used_pct = SWAP_THRASH_PCT;
-        assert_eq!(plan(&i), Action::None);
-    }
-
-    #[test]
-    fn advice_reclaims_before_asking_anyone_to_quit() {
-        assert_eq!(advice(Pressure::Normal, 4096.0, 0.0), Advice::Hold);
-        assert_eq!(advice(Pressure::High, 4096.0, 10.0), Advice::ReclaimCache);
-        // Nothing reclaimable, or swap is already thrashing: apps are the lever.
-        assert_eq!(advice(Pressure::High, 512.0, 10.0), Advice::TrimApps);
-        assert_eq!(
-            advice(Pressure::Critical, 4096.0, SWAP_THRASH_PCT),
-            Advice::TrimApps
-        );
-    }
-
-    #[test]
     fn trend_is_positive_growth_only() {
         let rising = trend(&[(0.0, 100.0, 50.0), (10.0, 300.0, 150.0)], 20.0);
         assert!((rising.compressed_mb_per_s - 20.0).abs() < 1e-9);
@@ -276,16 +150,5 @@ mod tests {
             trend(&[(0.0, 1.0, 1.0), (5.0, 9.0, 9.0)], 0.0),
             Trend::default()
         );
-    }
-
-    #[test]
-    fn cooldown_and_hourly_cap_are_enforced() {
-        let mut i = inputs();
-        i.since_last_s = COOLDOWN_S - 1;
-        assert_eq!(plan(&i), Action::None);
-        i.since_last_s = COOLDOWN_S;
-        assert_eq!(plan(&i), Action::Purge);
-        i.reclaims_last_hour = MAX_PER_HOUR;
-        assert_eq!(plan(&i), Action::None);
     }
 }

@@ -699,20 +699,29 @@ func memoryPressureLevel(freePercent: Double, swapUsedPercent: Double, compresse
     return .normal
 }
 
-/// Pure candidate policy. A high-pressure event waits 10 minutes of idleness;
-/// a critical one waits 5. The app can still refuse to quit.
+/// A hot chassis is a second, independent reason to act sooner: the compressor
+/// churn is already turning into heat, so waiting the full 10 minutes for
+/// warning-level pressure would let the machine cook first.
+func memoryIdleThreshold(pressure: MemoryPressure, band: String) -> Double {
+    if band == "hot" || band == "critical" { return 300 }
+    return pressure == .critical ? 300 : 600
+}
+
+/// Pure candidate policy. A high-pressure event waits the mode's idleness
+/// threshold; a critical one, or a hot chip, waits five minutes. The app can
+/// still refuse to quit.
 func shouldQuitIdleApp(
     _ app: MemoryAppState,
     pressure: MemoryPressure,
     enabled: Bool,
     idleFor: Double,
-    refused: Bool
+    refused: Bool,
+    band: String = ""
 ) -> Bool {
     guard enabled, pressure != .normal, !refused else { return false }
     guard !app.protectedApp, !app.hasWindow, !app.frontmost, !app.audio, !app.media else { return false }
     guard app.cpu < 3.0 else { return false }
-    let threshold: Double = pressure == .critical ? 300 : 600
-    return idleFor >= threshold
+    return idleFor >= memoryIdleThreshold(pressure: pressure, band: band)
 }
 
 func megabytes(_ token: Substring) -> Double {
@@ -734,6 +743,24 @@ func swapValue(_ text: String, label: String) -> Double {
     guard let range = text.range(of: "\(label) = ") else { return 0 }
     let token = text[range.upperBound...].split(separator: " ", maxSplits: 1).first ?? ""
     return megabytes(token)
+}
+
+/// The helper is the fast path: it samples Mach in-process every 2 s. But an
+/// older helper replies without the VM totals, and a zeroed struct would render
+/// the memory card "unreadable" forever. Only trust numbers that carry a total;
+/// otherwise read locally.
+func resolvedMemoryStats(daemon: MemoryStats?, local: () -> MemoryStats) -> MemoryStats {
+    if let d = daemon, d.readable, d.totalMB > 0 { return d }
+    return local()
+}
+
+/// The app and its privileged helper are installed separately: a DMG install
+/// replaces the app, while launchd keeps running the helper it loaded at boot.
+/// A version mismatch means the UI is talking to an older daemon, and every
+/// field the new app expects may be missing.
+func helperIsStale(running: Bool, daemon: String, app: String) -> Bool {
+    guard running, !app.isEmpty, app != "unknown" else { return false }
+    return daemon != app
 }
 
 func memoryStats() -> MemoryStats {
@@ -1433,7 +1460,7 @@ struct RootView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 11) {
                     hero
-                    if !d.helperRunning { helperBanner }
+                    if !d.helperRunning || d.helperStale { helperBanner }
                     modeCard
                     fanCard
                     guardCard
@@ -1558,12 +1585,18 @@ struct RootView: View {
 
     private var helperBannerTitle: String {
         if d.helperInstallState == .installing { return "Installing thermal helper…" }
+        if d.helperStale {
+            return "Thermal helper is out of date (\(d.daemonVersion.isEmpty ? "older build" : d.daemonVersion))"
+        }
         return d.helperPresent
             ? "Thermal helper is installed but not responding"
             : "Install the thermal helper to begin"
     }
 
     private var helperBannerDescription: String {
+        if d.helperStale {
+            return "This app is \(d.appVersion) but the running helper is not. Installing a new DMG replaces the app, not the privileged helper launchd already loaded, so the old helper keeps answering. Update it to \(d.appVersion) — it is a one-time admin prompt."
+        }
         if d.helperPresent {
             return "The machine-wide helper is loaded, but its status socket is unavailable. Repair it to reload the service."
         }
@@ -1571,7 +1604,8 @@ struct RootView: View {
     }
 
     private var helperBannerButtonTitle: String {
-        d.helperPresent ? "Repair Thermal Helper…" : "Install Thermal Helper…"
+        if d.helperStale { return "Update Thermal Helper…" }
+        return d.helperPresent ? "Repair Thermal Helper…" : "Install Thermal Helper…"
     }
 
     // MARK: controls
@@ -1845,10 +1879,23 @@ struct RootView: View {
                 .controlSize(.mini)
                 .font(.system(size: 12, weight: .medium))
 
-            Text("Runs in every mode except Off. Under high pressure, apps with no window that have been idle for 10+ minutes are asked to quit gracefully (5 minutes at critical pressure). Apps can refuse; nothing is force-killed and no purge is run.")
+            Text("Runs in every mode except Off. The daemon decides the ladder — drop reclaimable cache first, ask an idle app to quit only if that is not enough — and this panel only executes the surviving step. Auto and Balanced wait for real pressure; Cool & Quiet and Max Cool act at high pressure and trim earlier when the chip is hot. Nothing is force-killed.")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if !d.memoryPlanDetail.isEmpty {
+                Text("Governor: \(d.memoryPlanDetail)")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(d.memoryPlan == "hold" ? .secondary : .primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if d.memoryHeatLoad >= 1 {
+                Text(String(format: "Compressor churn %.0f pages/s (%@ die) — this is heat, not just latency", d.memoryHeatLoad, d.memoryBand))
+                    .font(.system(size: 10))
+                    .foregroundStyle(d.memoryBand == "cool" || d.memoryBand == "warm" ? Color.secondary : Color.orange)
+            }
 
             if !d.memoryTop.isEmpty {
                 VStack(alignment: .leading, spacing: 3) {
@@ -1983,7 +2030,9 @@ struct RootView: View {
 
             Menu {
                 Toggle("Start at login", isOn: Binding(get: { d.loginOn }, set: { d.setLogin($0) }))
-                if !d.helperPresent {
+                if d.helperStale {
+                    Button("Update Thermal Helper…") { d.installHelper() }
+                } else if !d.helperPresent {
                     Button("Install Thermal Helper…") { d.installHelper() }
                 }
                 Divider()
@@ -2190,6 +2239,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var helperRunning = false
     @Published var helperPresent = false
     @Published var helperInstallState: HelperInstallState = .unknown
+    /// The running helper's own version, from its status reply. A DMG install
+    /// does not replace a privileged helper that launchd already loaded, so
+    /// this is the only way the app can notice it is talking to an old daemon.
+    @Published var daemonVersion = ""
+    @Published var helperStale = false
     private let helperAutoInstallAttemptedKey = "helperAutoInstallAttempted"
     @Published var loginOn = false
     @Published var temp: Double?
@@ -2242,6 +2296,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var memoryReclaimable = 0.0
     @Published var memoryAdvice = "hold"
     @Published var memoryTrend = 0.0
+    /// The daemon's ladder decision and the thermal context behind it. The UI
+    /// renders this instead of re-deriving pressure from its own sampling.
+    @Published var memoryPlan = "hold"
+    @Published var memoryPlanReason = "comfortable"
+    @Published var memoryPlanDetail = ""
+    @Published var memoryBand = "warm"
+    @Published var memoryHeatLoad = 0.0
+    /// Latest VM numbers from the daemon, so the UI does not fork
+    /// `vm_stat`/`sysctl` while the helper is answering.
+    var daemonMemory: MemoryStats?
     var lastMemoryScan: Date?
     var lastChromeScan: Date?
 
@@ -2643,7 +2707,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     func refreshMemoryGuard() {
-        let stats = memoryStats()
+        // The daemon already samples Mach every 2 s for ~15 µs. Forking
+        // `vm_stat` + `sysctl` here on top of that was measurable heat for a
+        // number we were about to overwrite anyway, so the fork only happens
+        // when the helper is not answering.
+        let stats = resolvedMemoryStats(daemon: daemonMemory) { memoryStats() }
         memoryFree = stats.freePercent
         memorySwap = stats.swapTotalMB > 0
             ? String(format: "%.0f/%.0f MB", stats.swapUsedMB, stats.swapTotalMB)
@@ -2658,6 +2726,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         guard stats.readable else { memoryStatus = "unreadable"; return }
         guard mode != "off" else { memoryStatus = "off (mode)"; return }
 
+        // The daemon owns the ladder. The UI only executes the rung that
+        // survived it, so the two can never disagree about pressure.
+        let plan = helperRunning ? memoryPlan : (stats.pressure == .normal ? "hold" : "trim")
+
         let now = Date()
         let nowEpoch = now.timeIntervalSince1970
         let apps = memoryAppStates(sample: cpuSample())
@@ -2666,6 +2738,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         refused = refused.filter { $0.value > nowEpoch }
         saveDoubleMap("memoryRefused", refused)
 
+        // Idleness is tracked on every pass, not only on a "trim" pass, so the
+        // first real decision already has a history to judge.
         for app in apps {
             if app.frontmost || app.hasWindow || app.audio || app.media || app.cpu >= 3.0 {
                 last[app.bundleID] = nowEpoch
@@ -2677,11 +2751,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         last = last.filter { live.contains($0.key) }
         saveDoubleMap("memoryLastActive", last)
 
+        guard plan == "trim" else {
+            memoryStatus = plan == "reclaim"
+                ? "cache reclaimed · no app touched"
+                : "watching · \(memoryPlanReason)"
+            return
+        }
+
         guard stats.pressure != .normal else {
             memoryStatus = "normal"
             return
         }
 
+        let band = helperRunning ? memoryBand : ""
         let candidates = apps.compactMap { app -> (MemoryAppState, Double)? in
             let idle = nowEpoch - (last[app.bundleID] ?? nowEpoch)
             let isRefused = (refused[app.bundleID] ?? 0) > nowEpoch
@@ -2690,7 +2772,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 pressure: stats.pressure,
                 enabled: true,
                 idleFor: idle,
-                refused: isRefused
+                refused: isRefused,
+                band: band
             )
             return ok ? (app, idle) : nil
         }.sorted { $0.1 > $1.1 }
@@ -2702,7 +2785,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         guard let running = NSRunningApplication(processIdentifier: victim.pid) else { return }
         if running.terminate() {
             memoryStatus = "asked \(victim.name) to quit"
-            memoryNote = "Graceful quit requested for \(victim.name) after \(Int(idle / 60)) min idle; it can refuse or ask you to save."
+            let why = memoryPlanDetail.isEmpty ? "" : " \(memoryPlanDetail)"
+            memoryNote = "Graceful quit requested for \(victim.name) after \(Int(idle / 60)) min idle; it can refuse or ask you to save.\(why)"
         } else {
             memoryStatus = "\(victim.name) refused to quit"
             memoryNote = "Left \(victim.name) alone for 30 minutes."
@@ -2915,7 +2999,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         performHelperInstall()
     }
 
+    /// A DMG install replaces the app, not the privileged helper that launchd
+    /// already loaded. `refresh()` notices the version mismatch and offers an
+    /// update button; the user decides when to take the admin prompt, so a new
+    /// release never asks for a password on its own.
     private func performHelperInstall() {
+        guard helperInstallState != .installing else { return }
         guard let script = Bundle.main.path(forResource: "install-helper", ofType: "sh") else {
             helperInstallState = .failed("install-helper.sh missing from the app bundle.")
             hint = "install-helper.sh missing from the app bundle."
@@ -2950,6 +3039,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             hint = "Could not start the privileged installer."
         }
         DispatchQueue.main.async { self.refresh() }
+        // The reloaded helper answers on a fresh socket a moment later; without
+        // this the banner can keep saying "out of date" until the next tick.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.refresh() }
     }
 
     // MARK: login item
@@ -3024,6 +3116,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
         guard let s = requestStatus() else {
             helperRunning = false
+            daemonVersion = ""
+            helperStale = false
             statusItem?.button?.title = "—°"
             temp = nil
             fan = nil
@@ -3034,6 +3128,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             return
         }
         helperRunning = true
+        daemonVersion = s["daemon_version"] as? String ?? ""
+        // An older helper that predates `daemon_version` is stale by
+        // definition. `unknown` is the self-test binary, which has no bundle
+        // version to compare against.
+        let stale = helperIsStale(running: true, daemon: daemonVersion, app: appVersion)
+        helperStale = stale
 
         temp = s["cpu_temp"] as? Double
         fan = s["fan_rpm"] as? Double
@@ -3076,9 +3176,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         memoryReclaimable = s["memory_reclaimable_mb"] as? Double ?? 0
         memoryAdvice = s["memory_advice"] as? String ?? "hold"
         memoryTrend = s["memory_trend_mb_s"] as? Double ?? 0
-        // The daemon samples the kernel's own VM counters every 2 s; trust that
-        // verdict over the UI's coarser reading when the helper is running.
-        if let p = s["memory_pressure"] as? String, helperRunning { memoryPressure = p }
+        memoryPlan = s["memory_plan"] as? String ?? memoryAdvice
+        memoryPlanReason = s["memory_plan_reason"] as? String ?? ""
+        memoryPlanDetail = s["memory_plan_detail"] as? String ?? ""
+        memoryBand = s["memory_band"] as? String ?? "warm"
+        memoryHeatLoad = s["memory_heat_load"] as? Double ?? 0
+        // The daemon samples the kernel's own VM counters every 2 s from Mach.
+        // Trust that verdict over the UI's coarser `vm_stat` reading, and keep
+        // the numbers so the guard does not have to spawn a child for them.
+        if helperRunning {
+            // Daemon is answering; trust its Mach sampling over our `vm_stat`.
+            var m = MemoryStats()
+            m.totalMB = s["memory_total_mb"] as? Double ?? 0
+            m.freePercent = s["memory_free_pct"] as? Double ?? 0
+            m.compressedMB = s["memory_compressed_mb"] as? Double ?? 0
+            m.swapUsedMB = s["memory_swap_used_mb"] as? Double ?? 0
+            m.swapTotalMB = s["memory_swap_total_mb"] as? Double ?? 0
+            m.pressure = (s["memory_pressure"] as? String).flatMap(MemoryPressure.init(rawValue:)) ?? .normal
+            m.readable = m.totalMB > 0
+            if let p = s["memory_pressure"] as? String { memoryPressure = p }
+            // An old helper does not publish the VM totals at all. Keeping that
+            // zeroed object would render the card "unreadable" forever, so fall
+            // back to a direct read instead — slower, but correct.
+            daemonMemory = m.readable ? m : nil
+        } else {
+            daemonMemory = nil
+        }
 
         // The three user-space guards are heavier than reading daemon status,
         // so each runs on its own cadence. Chrome is checked often enough to
@@ -3211,12 +3334,47 @@ if CommandLine.arguments.contains("--self-test") {
     var busy = mem; busy.cpu = 3.0
     expectEq("memory: busy apps are never quit", shouldQuitIdleApp(busy, pressure: .critical, enabled: true, idleFor: 99999, refused: false), false)
 
+    // The daemon's thermal band shortens the wait: churn that is already
+    // turning into heat is not worth ten minutes of patience.
+    expectEq("memory: a hot chip waits five minutes at high pressure", memoryIdleThreshold(pressure: .high, band: "hot"), 300)
+    expectEq("memory: a critical chip waits five minutes", memoryIdleThreshold(pressure: .high, band: "critical"), 300)
+    expectEq("memory: a warm chip keeps the ten-minute wait", memoryIdleThreshold(pressure: .high, band: "warm"), 600)
+    expectEq("memory: critical pressure is five minutes regardless", memoryIdleThreshold(pressure: .critical, band: "cool"), 300)
+    expectEq("memory: a hot chip shortens the policy", shouldQuitIdleApp(mem, pressure: .high, enabled: true, idleFor: 300, refused: false, band: "hot"), true)
+    expectEq("memory: the same app on a warm chip is left alone", shouldQuitIdleApp(mem, pressure: .high, enabled: true, idleFor: 300, refused: false, band: "warm"), false)
+    expectEq("memory: normal pressure still never quits when hot", shouldQuitIdleApp(mem, pressure: .normal, enabled: true, idleFor: 99999, refused: false, band: "critical"), false)
+
     expectEq("memory: healthy machine is normal", memoryPressureLevel(freePercent: 50, swapUsedPercent: 0, compressedPercent: 0), .normal)
     expectEq("memory: low free RAM is high", memoryPressureLevel(freePercent: 10, swapUsedPercent: 0, compressedPercent: 0), .high)
     expectEq("memory: very low free RAM is critical", memoryPressureLevel(freePercent: 5, swapUsedPercent: 0, compressedPercent: 0), .critical)
     expectEq("memory: full swap is critical", memoryPressureLevel(freePercent: 50, swapUsedPercent: 80, compressedPercent: 0), .critical)
     expectEq("memory: heavy compression is critical", memoryPressureLevel(freePercent: 50, swapUsedPercent: 0, compressedPercent: 60), .critical)
     expectEq("memory: unreadable pressure is critical", memoryPressureLevel(freePercent: .nan, swapUsedPercent: 0, compressedPercent: 0), .critical)
+
+    // ---- Which memory snapshot the card may show ----
+    // A helper that predates the VM fields replies without a total. Trusting a
+    // zeroed struct is exactly what made the card read "unreadable".
+    var oldHelper = MemoryStats()
+    oldHelper.freePercent = 0.4
+    oldHelper.readable = true   // it did answer, just without the totals
+    expectEq("memory: a helper without totals is not trusted",
+             resolvedMemoryStats(daemon: oldHelper) { MemoryStats(readable: true, freePercent: 30, totalMB: 8192) }.freePercent,
+             30)
+    expectEq("memory: a complete helper is preferred",
+             resolvedMemoryStats(daemon: MemoryStats(readable: true, freePercent: 41, totalMB: 8192)) { MemoryStats(readable: true, freePercent: 30, totalMB: 8192) }.freePercent,
+             41)
+    expectEq("memory: no helper falls back to a local read",
+             resolvedMemoryStats(daemon: nil) { MemoryStats(readable: true, freePercent: 30, totalMB: 8192) }.freePercent,
+             30)
+
+    // ---- Helper freshness ----
+    // A DMG install replaces the app, not the privileged helper launchd is
+    // already running; the version is the only proof the daemon is current.
+    expectEq("helper: matching version is fresh", helperIsStale(running: true, daemon: "1.9.1", app: "1.9.1"), false)
+    expectEq("helper: older daemon is stale", helperIsStale(running: true, daemon: "1.8.4", app: "1.9.1"), true)
+    expectEq("helper: a daemon without a version is stale", helperIsStale(running: true, daemon: "", app: "1.9.1"), true)
+    expectEq("helper: stopped helper is not stale, it is absent", helperIsStale(running: false, daemon: "", app: "1.9.1"), false)
+    expectEq("helper: a versionless self-test build never prompts", helperIsStale(running: true, daemon: "1.9.1", app: "unknown"), false)
 
     // ---- Reduced visual effects policy ----
     expectEq("effects: on by default in Auto", effectsDesired(enabled: true, mode: "auto"), true)
@@ -3339,11 +3497,46 @@ if CommandLine.arguments.contains("--chrome-check") {
     exit(0)
 }
 if CommandLine.arguments.contains("--memory-check") {
-    let stats = memoryStats()
+    let local = memoryStats()
     let apps = memoryAppStates(sample: cpuSample())
     let protected = apps.filter { $0.protectedApp }.count
     let idle = apps.filter { !$0.protectedApp && !$0.hasWindow && !$0.frontmost && !$0.audio && !$0.media && $0.cpu < 3.0 }.count
-    print("{\"readable\":\(stats.readable),\"free_percent\":\(Int(stats.freePercent)),\"swap_used_mb\":\(Int(stats.swapUsedMB)),\"swap_total_mb\":\(Int(stats.swapTotalMB)),\"compressed_mb\":\(Int(stats.compressedMB)),\"pressure\":\"\(stats.pressure.rawValue)\",\"apps\":\(apps.count),\"protected\":\(protected),\"idle_candidates\":\(idle)}")
+    // The daemon's own verdict, when it is answering: plan, reason, band and
+    // the churn that turned memory pressure into heat.
+    var plan = "hold"
+    var reason = "unavailable"
+    var band = "warm"
+    var heat = 0.0
+    var daemonVersion = ""
+    var daemonTotalMB = 0.0
+    var daemonFreePct = 0.0
+    var helperAnswered = false
+    if let reply = sendRequest("{\"cmd\":\"status\"}"),
+       let data = reply.data(using: .utf8),
+       let s = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        helperAnswered = true
+        plan = s["memory_plan"] as? String ?? plan
+        reason = s["memory_plan_reason"] as? String ?? reason
+        band = s["memory_band"] as? String ?? band
+        heat = s["memory_heat_load"] as? Double ?? heat
+        daemonVersion = s["daemon_version"] as? String ?? ""
+        daemonTotalMB = s["memory_total_mb"] as? Double ?? 0
+        daemonFreePct = s["memory_free_pct"] as? Double ?? 0
+    }
+    // The exact resolution the UI uses, so this check reports what the panel
+    // will actually show instead of a second, rosier measurement.
+    var daemonStats: MemoryStats?
+    if daemonTotalMB > 0 {
+        var m = MemoryStats()
+        m.totalMB = daemonTotalMB
+        m.readable = true
+        m.freePercent = daemonFreePct
+        daemonStats = m
+    }
+    let stats = resolvedMemoryStats(daemon: daemonStats) { local }
+    let source = daemonStats == nil ? "local" : "daemon"
+    let stale = helperIsStale(running: helperAnswered, daemon: daemonVersion, app: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")
+    print("{\"readable\":\(stats.readable),\"free_percent\":\(Int(stats.freePercent)),\"swap_used_mb\":\(Int(stats.swapUsedMB)),\"swap_total_mb\":\(Int(stats.swapTotalMB)),\"compressed_mb\":\(Int(stats.compressedMB)),\"pressure\":\"\(stats.pressure.rawValue)\",\"source\":\"\(source)\",\"helper_running\":\(helperAnswered),\"helper_stale\":\(stale),\"daemon_version\":\"\(daemonVersion)\",\"daemon_total_mb\":\(Int(daemonTotalMB)),\"apps\":\(apps.count),\"protected\":\(protected),\"idle_candidates\":\(idle),\"plan\":\"\(plan)\",\"reason\":\"\(reason)\",\"band\":\"\(band)\",\"heat_load\":\(Int(heat))}")
     exit(0)
 }
 if CommandLine.arguments.contains("--effects-check") {

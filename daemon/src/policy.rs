@@ -59,7 +59,7 @@ const AUTO_RELEASE_C: f64 = 74.0;
 /// Minimum time the cap stays engaged before it may be released again.
 const AUTO_DWELL_S: u64 = 20;
 /// `CPU_Speed_Limit` below this means macOS is already starving the CPU.
-const THROTTLE_LIMIT: u32 = 95;
+pub const THROTTLE_LIMIT: u32 = 95;
 /// Throttling only counts as a reason to cap once the chip is at least warm,
 /// so a brief OS scheduling dip does not clamp the power envelope.
 const AUTO_THROTTLE_C: f64 = 72.0;
